@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630" role="img" aria-label="Apex Pest Solutions — Professional Pest Control">
+<defs>
+  <linearGradient id="ob" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#002D3D"/><stop offset="1" stop-color="#003B52"/></linearGradient>
+  <radialGradient id="og" cx=".8" cy=".2" r=".6"><stop offset="0" stop-color="#00E6A7" stop-opacity=".3"/><stop offset="1" stop-color="#00E6A7" stop-opacity="0"/></radialGradient>
+</defs>
+<rect width="1200" height="630" fill="url(#ob)"/>
+<rect width="1200" height="630" fill="url(#og)"/>
+<circle cx="1010" cy="150" r="60" fill="none" stroke="#00E6A7" stroke-opacity="0.200" stroke-width="1.6"/><circle cx="1010" cy="150" r="114" fill="none" stroke="#00E6A7" stroke-opacity="0.175" stroke-width="1"/><circle cx="1010" cy="150" r="168" fill="none" stroke="#00E6A7" stroke-opacity="0.150" stroke-width="1"/><circle cx="1010" cy="150" r="222" fill="none" stroke="#00E6A7" stroke-opacity="0.125" stroke-width="1.6"/><circle cx="1010" cy="150" r="276" fill="none" stroke="#00E6A7" stroke-opacity="0.100" stroke-width="1"/><circle cx="1010" cy="150" r="330" fill="none" stroke="#00E6A7" stroke-opacity="0.075" stroke-width="1"/><circle cx="1010" cy="150" r="384" fill="none" stroke="#00E6A7" stroke-opacity="0.050" stroke-width="1.6"/>
+<g fill="none" stroke="#E8F7F2" stroke-opacity="0.09" stroke-width="1.4"><path d="M-60 460 C 240 400, 420 520, 660 436 S 1020 514, 1260 448"/><path d="M-60 504 C 240 450.25, 420 557.75, 660 482.5 S 1020 552.375, 1260 493.25"/><path d="M-60 548 C 240 500.5, 420 595.5, 660 529 S 1020 590.75, 1260 538.5"/><path d="M-60 592 C 240 550.75, 420 633.25, 660 575.5 S 1020 629.125, 1260 583.75"/><path d="M-60 636 C 240 601, 420 671, 660 622 S 1020 667.5, 1260 629"/><path d="M-60 680 C 240 651.25, 420 708.75, 660 668.5 S 1020 705.875, 1260 674.25"/></g>
+<g transform="translate(84 150)">
+  <rect x="0" y="0" width="56" height="56" rx="17" fill="#00E6A7"/>
+  <path d="M16 28 L25 38 L42 18" fill="none" stroke="#002D3D" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="76" y="26" font-family="Georgia, serif" font-size="19" letter-spacing="5" fill="#00E6A7">APEX PEST SOLUTIONS</text>
+  <text x="76" y="52" font-family="Georgia, serif" font-size="15" letter-spacing="3" fill="#9FBAC4">LICENSED · INSURED · 24/7</text>
+  <text x="0" y="150" font-family="Georgia, serif" font-size="76" font-weight="bold" fill="#FFFFFF">Eliminate Pests</text>
+  <text x="0" y="238" font-family="Georgia, serif" font-size="76" font-weight="bold" fill="#00E6A7">Once &amp; For All</text>
+  <text x="0" y="300" font-family="Georgia, serif" font-size="24" fill="#B9CED6">Free inspections · Same-day service · AI assistant online 24/7</text>
+</g>
+</svg>
