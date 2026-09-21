@@ -1,1473 +1,1639 @@
 /* ==========================================================================
-   Apex Pest Solutions — script.js
-   Vanilla JS, no dependencies.
+   script.js — everything the page does at runtime.
 
-   Integration points are isolated in CONFIG + the three adapter objects
-   (AIProvider, BookingAPI, LeadAPI) so a real backend can be connected
-   without touching any UI code.
+   Reads businessConfig (config.js) and never hardcodes business detail.
+   Structure:
+     1  helpers
+     2  binding engine        — data-bind-* / data-show / data-hide / data-list
+     3  SEO + structured data — title, canonical, Open Graph, JSON-LD
+     4  content renderers     — services, FAQ, hours, footer, credentials
+     5  chrome                — header, drawer, scrollspy, reveal
+     6  booking               — the six-step flow
+     7  business setup        — the local configuration panel
+     8  assistant             — answers from the FAQ, no network calls
    ========================================================================== */
 (() => {
   'use strict';
 
-  /* ======================================================================
-     0. CONFIG — the only block you normally need to edit
-     ====================================================================== */
-  const CONFIG = {
-    business: {
-      name: 'Apex Pest Solutions',
-      phone: '+17135550142',
-      phoneDisplay: '(713) 555-0142',
-      email: 'hello@apexpestsolutions.com',
-      // ZIP prefixes we service. Anything else triggers the out-of-area flow.
-      serviceZipPrefixes: ['770', '771', '772', '773', '774', '775', '776', '778'],
-    },
+  const CFG = window.businessConfig;
+  if (!CFG) { console.error('[app] config.js did not load.'); return; }
 
-    ai: {
-      /* 'mock'  → the built-in rule-based receptionist (no network calls)
-         'api'   → POST {messages, context} to `endpoint`, expects
-                   { reply: string, quickReplies?: string[], action?: string }
-
-         Example wiring for OpenAI / Anthropic / your own gateway:
-           provider: 'api',
-           endpoint: '/api/assistant',
-           headers: { 'Content-Type': 'application/json' },
-         Never put a provider API key in client-side code — proxy it. */
-      provider: 'mock',
-      endpoint: '',
-      headers: { 'Content-Type': 'application/json' },
-      systemPrompt:
-        'You are the virtual receptionist for Apex Pest Solutions, a licensed pest control ' +
-        'company in Houston, TX. Be concise, warm and practical. Identify the pest, confirm ' +
-        'the service area by ZIP, then offer a free inspection booking.',
-      typingSpeed: [520, 1150], // simulated "thinking" window, ms
-      speech: { enabled: true, lang: 'en-US' },
-    },
-
-    booking: {
-      /* 'mock'     → resolves locally (demo mode)
-         'webhook'  → POST the payload to `endpoint` (Web3Forms, Formspree,
-                      Make/Zapier, or your own API route)
-         Downstream adapters (Google Calendar, Calendly, CRM, SMS) are
-         intentionally server-side concerns: send them one payload from
-         `endpoint` and fan out there. */
-      provider: 'mock',
-      endpoint: '',
-      leadTimeDays: 1,      // earliest bookable day from today
-      horizonDays: 75,      // furthest bookable day
-      closedWeekdays: [0],  // 0 = Sunday
-      slots: [
-        { id: '08-10', label: '8:00 – 10:00 AM', note: 'Early window' },
-        { id: '10-12', label: '10:00 – 12:00 PM', note: 'Most requested' },
-        { id: '12-14', label: '12:00 – 2:00 PM', note: 'Midday' },
-        { id: '14-16', label: '2:00 – 4:00 PM', note: 'Afternoon' },
-        { id: '16-18', label: '4:00 – 6:00 PM', note: 'After work' },
-      ],
-    },
-
-    lead: {
-      /* Newsletter / lead capture. Same pattern as booking. */
-      provider: 'mock',
-      endpoint: '',
-    },
-
-    /* Drop-in photography.
-       Every <img> carries a data-photo path pointing at the .jpg that should
-       replace the bundled brand art (e.g. assets/img/hero-technician.jpg).
-       Save your licensed photos at those paths, flip this to true, and they
-       are picked up automatically — no markup changes. Left false by default
-       so the browser never logs 404s for files that aren't there yet. */
-    photoSwap: false,
-  };
-
-  const SERVICE_LABELS = {
-    general: 'General Pest Control',
-    cockroach: 'Cockroach Control',
-    rodent: 'Rodent Removal',
-    termite: 'Termite Treatment',
-    bedbug: 'Bed Bug Treatment',
-    mosquito: 'Mosquito Control',
-    other: 'Other / Not sure',
-  };
-
-  /* ======================================================================
-     1. UTILITIES
-     ====================================================================== */
+  /* ===================== 1. helpers ====================== */
   const $  = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
   const on = (el, ev, fn, opts) => el && el.addEventListener(ev, fn, opts);
-  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-  const rand = (min, max) => Math.random() * (max - min) + min;
-  const prefersReduced = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-  /* Assistant replies may contain light emphasis markup. When the reply comes
-     from a remote endpoint we still only trust <strong>, <em> and <br>. */
-  const sanitizeRich = (html) =>
-    String(html)
-      .replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]))
-      .replace(/&lt;(\/?(?:strong|em|b|i))&gt;/gi, '<$1>')
-      .replace(/&lt;br\s*\/?&gt;/gi, '<br>');
+  /** Resolve 'business.phone' or '$.telHref' against a config snapshot. */
+  const read = (obj, path) =>
+    String(path).split('.').reduce((acc, key) => (acc == null ? acc : acc[key]), obj);
 
-  const escapeHtml = (str) =>
-    String(str).replace(/[&<>"']/g, (c) =>
-      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-
-  const toISO = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-  const fromISO = (s) => { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d); };
-  const startOfDay = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
-
-  const formatDate = (iso, opts) =>
-    fromISO(iso).toLocaleDateString('en-US', opts || { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
-
-  /* Deterministic per-date "availability" so the calendar behaves
-     consistently between renders. Replace with a real availability API. */
-  const hash = (str) => {
-    let h = 2166136261;
-    for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
-    return Math.abs(h);
-  };
-
-  const isValidEmail = (v) => /^[^\s@]+@[^\s@]+\.[a-z]{2,}$/i.test(v.trim());
-  const isValidPhone = (v) => (v.replace(/\D/g, '').length >= 10);
-  const isValidZip   = (v) => /^\d{5}$/.test(v.trim());
-  const inServiceArea = (zip) =>
-    CONFIG.business.serviceZipPrefixes.some((p) => zip.startsWith(p));
-
-  /* ======================================================================
-     2. HEADER, NAV, SCROLL STATE
-     ====================================================================== */
-  const initHeader = () => {
-    const header = $('[data-header]');
-    const bar = $('[data-mobile-bar]');
-    const hero = $('.hero');
-    if (!header) return;
-
-    let ticking = false;
-    const update = () => {
-      const y = window.scrollY;
-      header.classList.toggle('is-stuck', y > 24);
-      if (bar) bar.classList.toggle('is-visible', y > (hero ? hero.offsetHeight * 0.55 : 500));
-      ticking = false;
-    };
-    on(window, 'scroll', () => {
-      if (!ticking) { ticking = true; requestAnimationFrame(update); }
-    }, { passive: true });
-    update();
-  };
-
-  const initDrawer = () => {
-    const drawer = $('#mobile-nav');
-    const burger = $('[data-menu-open]');
-    if (!drawer || !burger) return;
-
-    let lastFocus = null;
-
-    const open = () => {
-      lastFocus = document.activeElement;
-      drawer.hidden = false;
-      requestAnimationFrame(() => drawer.classList.add('is-open'));
-      burger.setAttribute('aria-expanded', 'true');
-      document.body.classList.add('is-locked');
-      const first = $('.drawer__nav a', drawer);
-      if (first) setTimeout(() => first.focus(), 120);
-    };
-
-    const close = () => {
-      drawer.classList.remove('is-open');
-      burger.setAttribute('aria-expanded', 'false');
-      document.body.classList.remove('is-locked');
-      setTimeout(() => { drawer.hidden = true; }, 420);
-      if (lastFocus) lastFocus.focus();
-    };
-
-    on(burger, 'click', () => (drawer.hidden ? open() : close()));
-    $$('[data-menu-close]').forEach((el) => on(el, 'click', close));
-    $$('.drawer__nav a, .drawer__foot a', drawer).forEach((a) => on(a, 'click', close));
-    on(document, 'keydown', (e) => { if (e.key === 'Escape' && !drawer.hidden) close(); });
-
-    // Focus trap
-    on(drawer, 'keydown', (e) => {
-      if (e.key !== 'Tab') return;
-      const focusables = $$('a[href], button:not([disabled]), input', drawer)
-        .filter((el) => el.offsetParent !== null);
-      if (!focusables.length) return;
-      const first = focusables[0];
-      const last = focusables[focusables.length - 1];
-      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
-      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  /** Build a nested patch object from a dotted path: ('a.b', 1) -> {a:{b:1}} */
+  const patchOf = (path, value) => {
+    const keys = String(path).split('.');
+    const root = {};
+    let node = root;
+    keys.forEach((k, i) => {
+      if (i === keys.length - 1) node[k] = value;
+      else { node[k] = {}; node = node[k]; }
     });
+    return root;
   };
 
-  const initScrollSpy = () => {
-    const links = $$('.nav__link');
-    const map = new Map();
-    links.forEach((l) => {
-      const id = l.getAttribute('href');
-      const section = id && id.startsWith('#') ? $(id) : null;
-      if (section) map.set(section, l);
-    });
-    if (!map.size) return;
+  const esc = (s) => String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 
-    const io = new IntersectionObserver((entries) => {
-      entries.forEach((entry) => {
-        if (!entry.isIntersecting) return;
-        links.forEach((l) => l.classList.remove('is-current'));
-        const link = map.get(entry.target);
-        if (link) link.classList.add('is-current');
-      });
-    }, { rootMargin: '-45% 0px -50% 0px', threshold: 0 });
-
-    map.forEach((_, section) => io.observe(section));
-  };
-
-  /* ======================================================================
-     3. SCROLL REVEAL + COUNTERS
-     ====================================================================== */
-  const initReveal = () => {
-    const items = $$('[data-reveal]');
-    if (!items.length) return;
-    if (prefersReduced() || !('IntersectionObserver' in window)) {
-      items.forEach((el) => el.classList.add('is-revealed'));
-      return;
+  const el = (tag, attrs = {}, kids = []) => {
+    const node = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) {
+      if (v === false || v == null) continue;
+      if (k === 'class') node.className = v;
+      else if (k === 'text') node.textContent = v;
+      else if (k === 'html') node.innerHTML = v;
+      else if (k.startsWith('on') && typeof v === 'function') node.addEventListener(k.slice(2), v);
+      else node.setAttribute(k, v === true ? '' : v);
     }
-    items.forEach((el) => {
-      const d = el.getAttribute('data-reveal-delay');
-      if (d) el.style.setProperty('--reveal-delay', d);
-    });
-    const io = new IntersectionObserver((entries, obs) => {
-      entries.forEach((entry) => {
-        if (!entry.isIntersecting) return;
-        entry.target.classList.add('is-revealed');
-        obs.unobserve(entry.target);
-      });
-    }, { rootMargin: '0px 0px -8% 0px', threshold: 0.12 });
-    items.forEach((el) => io.observe(el));
+    (Array.isArray(kids) ? kids : [kids]).forEach((k) => k && node.append(k));
+    return node;
   };
 
-  const initCounters = () => {
-    const nodes = $$('[data-count]');
-    if (!nodes.length) return;
-
-    const run = (el) => {
-      const target = parseFloat(el.getAttribute('data-count-to')) || 0;
-      const suffix = el.getAttribute('data-count-suffix') || '';
-      if (prefersReduced()) { el.textContent = target.toLocaleString('en-US') + suffix; return; }
-
-      const duration = 1700;
-      const start = performance.now();
-      const tick = (now) => {
-        const p = Math.min((now - start) / duration, 1);
-        const eased = 1 - Math.pow(1 - p, 4);
-        el.textContent = Math.round(target * eased).toLocaleString('en-US') + suffix;
-        if (p < 1) requestAnimationFrame(tick);
-      };
-      requestAnimationFrame(tick);
-    };
-
-    if (!('IntersectionObserver' in window)) { nodes.forEach(run); return; }
-    const io = new IntersectionObserver((entries, obs) => {
-      entries.forEach((entry) => {
-        if (!entry.isIntersecting) return;
-        run(entry.target);
-        obs.unobserve(entry.target);
-      });
-    }, { threshold: 0.5 });
-    nodes.forEach((el) => io.observe(el));
+  const icon = (id, cls) => {
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('aria-hidden', 'true');
+    if (cls) svg.setAttribute('class', cls);
+    const use = document.createElementNS('http://www.w3.org/2000/svg', 'use');
+    use.setAttribute('href', '#' + id);
+    svg.append(use);
+    return svg;
   };
 
-  /* ======================================================================
-     4. ACCORDION
-     ====================================================================== */
-  const initAccordion = () => {
-    const root = $('[data-accordion]');
-    if (!root) return;
-    const items = $$('.accordion__item', root);
+  const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
+  const reduceMotion = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-    items.forEach((item) => {
-      const trigger = $('.accordion__trigger', item);
-      const panel = $('.accordion__panel', item);
-      if (!trigger || !panel) return;
-
-      on(trigger, 'click', () => {
-        const isOpen = item.classList.contains('is-open');
-        items.forEach((other) => {
-          const t = $('.accordion__trigger', other);
-          other.classList.remove('is-open');
-          if (t) t.setAttribute('aria-expanded', 'false');
-        });
-        if (!isOpen) {
-          item.classList.add('is-open');
-          trigger.setAttribute('aria-expanded', 'true');
-        }
-      });
-    });
-  };
-
-  /* ======================================================================
-     5. TESTIMONIAL CAROUSEL
-     ====================================================================== */
-  const initCarousel = () => {
-    const root = $('[data-carousel]');
-    if (!root) return;
-    const track = $('[data-carousel-track]', root);
-    const dotsWrap = $('[data-carousel-dots]', root);
-    const prev = $('[data-carousel-prev]');
-    const next = $('[data-carousel-next]');
-    if (!track) return;
-
-    const slides = $$('.quote', track);
-
-    const perView = () => {
-      const first = slides[0];
-      if (!first) return 1;
-      return Math.max(1, Math.round(track.clientWidth / (first.offsetWidth + 16)));
-    };
-    const pages = () => Math.max(1, slides.length - perView() + 1);
-
-    const buildDots = () => {
-      if (!dotsWrap) return;
-      dotsWrap.innerHTML = '';
-      for (let i = 0; i < pages(); i++) {
-        const b = document.createElement('button');
-        b.type = 'button';
-        b.setAttribute('role', 'tab');
-        b.setAttribute('aria-label', `Go to testimonial ${i + 1}`);
-        on(b, 'click', () => goTo(i));
-        dotsWrap.appendChild(b);
-      }
-      syncDots();
-    };
-
-    const index = () => {
-      const first = slides[0];
-      if (!first) return 0;
-      return Math.round(track.scrollLeft / (first.offsetWidth + 16));
-    };
-
-    const syncDots = () => {
-      if (!dotsWrap) return;
-      const i = Math.min(index(), pages() - 1);
-      $$('button', dotsWrap).forEach((b, n) => {
-        b.classList.toggle('is-active', n === i);
-        b.setAttribute('aria-selected', n === i ? 'true' : 'false');
-      });
-      if (prev) prev.disabled = i <= 0;
-      if (next) next.disabled = i >= pages() - 1;
-    };
-
-    const goTo = (i) => {
-      const first = slides[0];
-      if (!first) return;
-      track.scrollTo({ left: i * (first.offsetWidth + 16), behavior: prefersReduced() ? 'auto' : 'smooth' });
-    };
-
-    on(prev, 'click', () => goTo(Math.max(0, index() - 1)));
-    on(next, 'click', () => goTo(Math.min(pages() - 1, index() + 1)));
-
-    let raf;
-    on(track, 'scroll', () => {
-      cancelAnimationFrame(raf);
-      raf = requestAnimationFrame(syncDots);
-    }, { passive: true });
-
-    on(track, 'keydown', (e) => {
-      if (e.key === 'ArrowRight') { e.preventDefault(); goTo(Math.min(pages() - 1, index() + 1)); }
-      if (e.key === 'ArrowLeft')  { e.preventDefault(); goTo(Math.max(0, index() - 1)); }
-    });
-
-    let resizeT;
-    on(window, 'resize', () => { clearTimeout(resizeT); resizeT = setTimeout(buildDots, 200); });
-    buildDots();
-  };
-
-  /* ======================================================================
-     6. DROP-IN PHOTOGRAPHY
-     Ship your own licensed photos by saving them next to the bundled SVG
-     art using the same basename (e.g. assets/img/hero-technician.jpg).
-     They are picked up automatically — no markup changes needed.
-     ====================================================================== */
-  const initPhotoSwap = () => {
-    if (!CONFIG.photoSwap) return;
-    const swap = (img) => {
-      const src = img.getAttribute('data-photo');
-      if (!src) return;
-      const probe = new Image();
-      probe.onload = () => {
-        img.src = src;
-        img.removeAttribute('srcset');
-      };
-      probe.src = src;
-    };
-    const nodes = $$('img[data-photo]');
-    if ('requestIdleCallback' in window) requestIdleCallback(() => nodes.forEach(swap), { timeout: 2500 });
-    else setTimeout(() => nodes.forEach(swap), 1200);
-  };
-
-  /* ======================================================================
-     7. BOOKING API ADAPTER
-     Swap `CONFIG.booking.provider` to 'webhook' and point `endpoint` at a
-     route that fans out to Google Calendar / Calendly / your CRM / SMS +
-     email automation. The payload shape below is what that route receives.
-     ====================================================================== */
-  const BookingAPI = {
-    buildPayload(state, reference) {
-      return {
-        reference,
-        submittedAt: new Date().toISOString(),
-        source: 'website-booking-widget',
-        service: { id: state.service, label: SERVICE_LABELS[state.service] || state.service },
-        property: state.property,
-        appointment: {
-          date: state.date,
-          slotId: state.time,
-          slotLabel: (CONFIG.booking.slots.find((s) => s.id === state.time) || {}).label || state.time,
-          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-        },
-        customer: {
-          name: state.name,
-          phone: state.phone,
-          email: state.email,
-          address: state.address,
-          zip: state.zip,
-          notes: state.notes,
-          consent: !!state.consent,
-        },
-      };
-    },
-
-    async submit(payload) {
-      const { provider, endpoint } = CONFIG.booking;
-
-      if (provider === 'webhook' && endpoint) {
-        const res = await fetch(endpoint, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        });
-        if (!res.ok) throw new Error(`Booking failed with status ${res.status}`);
-        return res.json().catch(() => ({ ok: true }));
-      }
-
-      // Demo mode — simulates network latency, always succeeds.
-      await wait(rand(900, 1500));
-      return { ok: true, mock: true };
-    },
-  };
-
-  /* ======================================================================
-     8. BOOKING WIZARD
-     ====================================================================== */
-  const Booking = (() => {
-    const form = $('[data-booking-form]');
-    if (!form) return { prefill() {}, goto() {}, scrollIn() {}, step: 0 };
-
-    const railItems = $$('[data-booking-rail] .booking__rail-item');
-    const steps = $$('.booking__step', form);
-    const backBtn = $('[data-booking-back]', form);
-    const nextBtn = $('[data-booking-next]', form);
-    const nextLabel = $('[data-next-label]', form);
-    const submitBtn = $('[data-booking-submit]', form);
-    const submitLabel = $('[data-submit-label]', form);
-    const alertBox = $('[data-booking-alert]', form);
-    const calGrid = $('[data-cal-grid]');
-    const calMonth = $('[data-cal-month]');
-    const slotsWrap = $('[data-slots]');
-
-    const TOTAL_INPUT_STEPS = 5;
-    let step = 1;
-    let viewMonth = startOfDay(new Date());
-    let submitting = false;
-
-    const state = {
-      service: '', property: '', date: '', time: '',
-      name: '', phone: '', email: '', address: '', zip: '', notes: '', consent: false,
-    };
-
-    /* ---------- summary ---------- */
-    const setSummary = (key, value) => {
-      const el = $(`[data-summary="${key}"]`);
-      if (!el) return;
-      el.textContent = value || (key === 'contact' ? 'Not provided' : 'Not selected');
-      el.classList.toggle('is-set', !!value);
-    };
-
-    const refreshSummary = () => {
-      setSummary('service', SERVICE_LABELS[state.service] || '');
-      setSummary('property', state.property);
-      setSummary('date', state.date ? formatDate(state.date) : '');
-      const slot = CONFIG.booking.slots.find((s) => s.id === state.time);
-      setSummary('time', slot ? slot.label : '');
-      setSummary('contact', state.name ? `${state.name}${state.phone ? ' · ' + state.phone : ''}` : '');
-    };
-
-    /* ---------- step navigation ---------- */
-    const showStep = (n, focus = true) => {
-      step = n;
-      steps.forEach((s) => { s.hidden = Number(s.dataset.step) !== n; });
-      railItems.forEach((item) => {
-        const idx = Number(item.dataset.rail);
-        item.classList.toggle('is-active', idx === n);
-        item.classList.toggle('is-done', idx < n);
-      });
-
-      const done = n > TOTAL_INPUT_STEPS;
-      backBtn.hidden = n === 1 || done;
-      nextBtn.hidden = n >= TOTAL_INPUT_STEPS;
-      submitBtn.hidden = n !== TOTAL_INPUT_STEPS;
-      if (nextLabel) nextLabel.textContent = n === 4 ? 'Continue to details' : 'Continue';
-      if (alertBox) alertBox.hidden = true;
-
-      const rail = $('[data-booking-rail]');
-      const active = railItems[n - 1];
-      if (rail && active) rail.scrollTo({ left: Math.max(0, active.offsetLeft - 60), behavior: 'smooth' });
-
-      if (focus) {
-        const target = steps.find((s) => Number(s.dataset.step) === n);
-        const firstField = target && $('input:not([type="hidden"]), button, textarea', target);
-        if (firstField && n > 1) firstField.focus({ preventScroll: true });
-      }
-    };
-
-    /* ---------- validation ---------- */
-    const setFieldError = (name, message) => {
-      const msg = $(`[data-error-for="${name}"]`, form);
-      const input = $(`[name="${name}"]`, form);
-      const field = input ? input.closest('.field') : null;
-      if (msg) { msg.hidden = !message; if (message) msg.textContent = message; }
-      if (field) field.classList.toggle('is-invalid', !!message);
-      if (input) input.setAttribute('aria-invalid', message ? 'true' : 'false');
-    };
-
-    const validateStep = (n) => {
-      if (n === 1) {
-        if (!state.service) { setFieldError('service', 'Please choose a service to continue.'); return false; }
-        setFieldError('service', '');
-      }
-      if (n === 2) {
-        if (!state.property) { setFieldError('property', 'Please select a property type.'); return false; }
-        setFieldError('property', '');
-      }
-      if (n === 3) {
-        if (!state.date) { setFieldError('date', 'Please choose an available date.'); return false; }
-        setFieldError('date', '');
-      }
-      if (n === 4) {
-        if (!state.time) { setFieldError('time', 'Please pick an available time window.'); return false; }
-        setFieldError('time', '');
-      }
-      if (n === 5) {
-        let ok = true;
-        const checks = [
-          ['name', state.name.trim().length >= 2, 'Please enter your full name.'],
-          ['phone', isValidPhone(state.phone), 'Enter a valid phone number (at least 10 digits).'],
-          ['email', isValidEmail(state.email), 'Enter a valid email address.'],
-          ['zip', isValidZip(state.zip), 'Enter a valid 5-digit ZIP code.'],
-          ['address', state.address.trim().length >= 6, 'Please enter the address we should visit.'],
-          ['consent', state.consent, 'Please confirm we can contact you about the booking.'],
-        ];
-        checks.forEach(([name, valid, msg]) => {
-          setFieldError(name, valid ? '' : msg);
-          if (!valid && ok) {
-            ok = false;
-            const input = $(`[name="${name}"]`, form);
-            if (input) input.focus({ preventScroll: true });
-          }
-        });
-        return ok;
-      }
-      return true;
-    };
-
-    /* ---------- calendar ---------- */
-    const isBookable = (date) => {
-      const today = startOfDay(new Date());
-      const min = new Date(today); min.setDate(min.getDate() + CONFIG.booking.leadTimeDays);
-      const max = new Date(today); max.setDate(max.getDate() + CONFIG.booking.horizonDays);
-      if (date < min || date > max) return false;
-      if (CONFIG.booking.closedWeekdays.includes(date.getDay())) return false;
-      return true;
-    };
-
-    const renderCalendar = () => {
-      if (!calGrid || !calMonth) return;
-      calMonth.textContent = viewMonth.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
-      calGrid.innerHTML = '';
-
-      const year = viewMonth.getFullYear();
-      const month = viewMonth.getMonth();
-      const firstDay = new Date(year, month, 1);
-      // Monday-first offset
-      const offset = (firstDay.getDay() + 6) % 7;
-      const daysInMonth = new Date(year, month + 1, 0).getDate();
-      const todayISO = toISO(new Date());
-
-      for (let i = 0; i < offset; i++) {
-        const blank = document.createElement('span');
-        blank.className = 'cal-day is-empty';
-        blank.setAttribute('aria-hidden', 'true');
-        calGrid.appendChild(blank);
-      }
-
-      for (let d = 1; d <= daysInMonth; d++) {
-        const date = new Date(year, month, d);
-        const iso = toISO(date);
-        const btn = document.createElement('button');
-        btn.type = 'button';
-        btn.className = 'cal-day';
-        btn.textContent = String(d);
-        btn.dataset.date = iso;
-        btn.setAttribute('aria-label', formatDate(iso, { weekday: 'long', day: 'numeric', month: 'long' }));
-
-        if (iso === todayISO) btn.classList.add('is-today');
-        if (!isBookable(date)) { btn.disabled = true; btn.setAttribute('aria-disabled', 'true'); }
-        if (state.date === iso) { btn.classList.add('is-selected'); btn.setAttribute('aria-selected', 'true'); }
-
-        on(btn, 'click', () => {
-          state.date = iso;
-          state.time = '';
-          $('[name="date"]', form).value = iso;
-          $('[name="time"]', form).value = '';
-          setFieldError('date', '');
-          renderCalendar();
-          renderSlots();
-          refreshSummary();
-        });
-
-        calGrid.appendChild(btn);
-      }
-
-      // Disable back-navigation past the current month
-      const prevBtn = $('[data-cal-prev]');
-      if (prevBtn) {
-        const today = startOfDay(new Date());
-        prevBtn.disabled = year === today.getFullYear() && month === today.getMonth();
-      }
-    };
-
-    const renderSlots = () => {
-      if (!slotsWrap) return;
-      slotsWrap.innerHTML = '';
-
-      if (!state.date) {
-        slotsWrap.innerHTML = '<p class="slots__empty">Pick a date first and we\'ll show the open arrival windows.</p>';
-        return;
-      }
-
-      const seed = hash(state.date);
-      let available = 0;
-
-      CONFIG.booking.slots.forEach((slot, i) => {
-        const taken = (seed >> (i * 2)) % 5 === 0; // deterministic pseudo-availability
-        const btn = document.createElement('button');
-        btn.type = 'button';
-        btn.className = 'slot';
-        btn.style.animationDelay = `${i * 45}ms`;
-        btn.setAttribute('role', 'radio');
-        btn.setAttribute('aria-checked', state.time === slot.id ? 'true' : 'false');
-        btn.innerHTML = `<strong>${slot.label}</strong><span>${taken ? 'Fully booked' : slot.note}</span>`;
-
-        if (taken) { btn.disabled = true; }
-        else {
-          available++;
-          if (state.time === slot.id) btn.classList.add('is-selected');
-          on(btn, 'click', () => {
-            state.time = slot.id;
-            $('[name="time"]', form).value = slot.id;
-            setFieldError('time', '');
-            renderSlots();
-            refreshSummary();
-          });
-        }
-        slotsWrap.appendChild(btn);
-      });
-
-      if (!available) {
-        slotsWrap.innerHTML = '<p class="slots__empty">No windows left on that date — please choose another day.</p>';
-      }
-    };
-
-    /* ---------- submission ---------- */
-    const makeReference = () => {
-      const stamp = Date.now().toString(36).slice(-4).toUpperCase();
-      const noise = Math.random().toString(36).slice(2, 4).toUpperCase();
-      return `APX-${stamp}${noise}`;
-    };
-
-    const showReceipt = (reference) => {
-      const slot = CONFIG.booking.slots.find((s) => s.id === state.time);
-      const set = (key, val) => { const el = $(`[data-receipt="${key}"]`); if (el) el.textContent = val; };
-      set('ref', reference);
-      set('service', SERVICE_LABELS[state.service] || state.service);
-      set('property', state.property);
-      set('when', `${formatDate(state.date, { weekday: 'long', day: 'numeric', month: 'long' })} · ${slot ? slot.label : ''}`);
-      set('address', `${state.address}, ${state.zip}`);
-      set('contact', `${state.phone} · ${state.email}`);
-    };
-
-    const submit = async (e) => {
-      e.preventDefault();
-      if (submitting) return;                 // prevents double submission
-      if (!validateStep(5)) return;
-
-      submitting = true;
-      submitBtn.classList.add('is-loading');
-      submitBtn.disabled = true;
-      if (submitLabel) submitLabel.textContent = 'Confirming…';
-      if (alertBox) alertBox.hidden = true;
-
-      const reference = makeReference();
-      const payload = BookingAPI.buildPayload(state, reference);
-
-      try {
-        await BookingAPI.submit(payload);
-        showReceipt(reference);
-        showStep(6, false);
-        document.dispatchEvent(new CustomEvent('apex:booked', { detail: payload }));
-        $('#booking').scrollIntoView({ behavior: prefersReduced() ? 'auto' : 'smooth', block: 'start' });
-      } catch (err) {
-        if (alertBox) {
-          alertBox.hidden = false;
-          alertBox.textContent =
-            `We couldn't confirm that booking just now. Please try again, or call us on ${CONFIG.business.phoneDisplay} and we'll book it for you.`;
-        }
-        console.error('[Apex] Booking submission failed:', err);
-      } finally {
-        submitting = false;
-        submitBtn.classList.remove('is-loading');
-        submitBtn.disabled = false;
-        if (submitLabel) submitLabel.textContent = 'Confirm Booking';
-      }
-    };
-
-    const reset = () => {
-      form.reset();
-      Object.assign(state, {
-        service: '', property: '', date: '', time: '',
-        name: '', phone: '', email: '', address: '', zip: '', notes: '', consent: false,
-      });
-      ['service', 'property', 'date', 'time', 'name', 'phone', 'email', 'zip', 'address', 'consent']
-        .forEach((n) => setFieldError(n, ''));
-      viewMonth = startOfDay(new Date());
-      renderCalendar();
-      renderSlots();
-      refreshSummary();
-      showStep(1);
-    };
-
-    /* ---------- bindings ---------- */
-    on(form, 'change', (e) => {
-      const t = e.target;
-      if (!t.name) return;
-      if (t.type === 'checkbox') state[t.name] = t.checked;
-      else if (t.name in state) state[t.name] = t.value;
-      if (['service', 'property', 'consent'].includes(t.name)) setFieldError(t.name, '');
-      if (t.type === 'radio') {
-        $$(`[name="${t.name}"]`, form).forEach((r) => {
-          const chip = r.closest('.chip');
-          if (chip) chip.classList.toggle('is-checked', r.checked);
-        });
-      }
-      refreshSummary();
-    });
-
-    on(form, 'input', (e) => {
-      const t = e.target;
-      if (t.name && t.name in state && t.type !== 'checkbox') state[t.name] = t.value;
-      if (t.name === 'zip') t.value = t.value.replace(/\D/g, '').slice(0, 5);
-      const field = t.closest && t.closest('.field');
-      if (field && field.classList.contains('is-invalid')) setFieldError(t.name, '');
-      refreshSummary();
-    });
-
-    on(nextBtn, 'click', () => { if (validateStep(step)) showStep(Math.min(step + 1, TOTAL_INPUT_STEPS)); });
-    on(backBtn, 'click', () => showStep(Math.max(1, step - 1)));
-    on(form, 'submit', submit);
-    on($('[data-booking-reset]'), 'click', reset);
-
-    on($('[data-cal-prev]'), 'click', () => { viewMonth = new Date(viewMonth.getFullYear(), viewMonth.getMonth() - 1, 1); renderCalendar(); });
-    on($('[data-cal-next]'), 'click', () => { viewMonth = new Date(viewMonth.getFullYear(), viewMonth.getMonth() + 1, 1); renderCalendar(); });
-
-    // Enter should advance rather than submit while on early steps
-    on(form, 'keydown', (e) => {
-      if (e.key !== 'Enter' || e.target.tagName === 'TEXTAREA') return;
-      if (step < TOTAL_INPUT_STEPS) { e.preventDefault(); nextBtn.click(); }
-    });
-
-    renderCalendar();
-    renderSlots();
-    refreshSummary();
-    showStep(1, false);
-
-    /* ---------- public surface (used by the AI assistant + service cards) -- */
-    return {
-      prefill(serviceId) {
-        if (!serviceId || !(serviceId in SERVICE_LABELS)) return;
-        const input = $(`[name="service"][value="${serviceId}"]`, form);
-        if (!input) return;
-        input.checked = true;
-        input.dispatchEvent(new Event('change', { bubbles: true }));
-      },
-      goto(n) { showStep(n); },
-      scrollIn() {
-        const section = $('#booking');
-        if (section) section.scrollIntoView({ behavior: prefersReduced() ? 'auto' : 'smooth', block: 'start' });
-      },
-      get step() { return step; },
-    };
-  })();
-
-  const initServiceShortcuts = () => {
-    $$('[data-service-book]').forEach((btn) => {
-      on(btn, 'click', () => {
-        Booking.prefill(btn.getAttribute('data-service-book'));
-        Booking.goto(2);
-        Booking.scrollIn();
-      });
-    });
-  };
-
-  /* ======================================================================
-     9. AI PROVIDER ADAPTER
-     `provider: 'mock'` runs the rule-based receptionist below.
-     `provider: 'api'`  POSTs to CONFIG.ai.endpoint and expects
-        { reply: string, quickReplies?: [{label, value, action?}], action?: string }
-     Both return the same shape, so the UI never changes.
-     ====================================================================== */
-  const PESTS = {
-    cockroach: { match: /roach|cockroach|palmetto|water\s?bug/i, service: 'cockroach', label: 'cockroaches',
-      line: 'Cockroaches are one of the most common calls we get, and they respond very well to gel baiting.' },
-    rodent: { match: /rat\b|rats|mice|mouse|rodent|gnaw|scratching in the (wall|attic|ceiling)/i, service: 'rodent', label: 'rodents',
-      line: 'Rodents need trapping plus entry-point exclusion — otherwise they come straight back.' },
-    termite: { match: /termite|wood\s?damage|mud tube/i, service: 'termite', label: 'termites',
-      line: 'Termites are time-sensitive, so we treat those inspections as a priority.' },
-    bedbug: { match: /bed\s?bug|bedbug|bites at night|itchy bites/i, service: 'bedbug', label: 'bed bugs',
-      line: 'Bed bugs need a full-room treatment and a follow-up visit — DIY sprays usually spread them.' },
-    mosquito: { match: /mosquito|mosquitos|mosquitoes/i, service: 'mosquito', label: 'mosquitoes',
-      line: 'Mosquito control works best as a yard treatment plus removing standing-water breeding sites.' },
-    ant: { match: /\bants?\b|fire ant/i, service: 'general', label: 'ants',
-      line: 'Ants are usually a trail-and-nest problem, so we bait the colony rather than just the trail.' },
-    spider: { match: /spider|web|widow|recluse/i, service: 'general', label: 'spiders',
-      line: 'We clear webbing, treat harbourage points and put a perimeter barrier down.' },
-    flea: { match: /flea/i, service: 'general', label: 'fleas',
-      line: 'Fleas need the full life cycle treated — adults, eggs and larvae — inside and in the yard.' },
-    fly: { match: /\bflies\b|\bfly\b|gnat|fruit fly/i, service: 'general', label: 'flies',
-      line: 'Flies almost always trace back to a breeding source, so we find that first.' },
-    bee: { match: /bee\b|bees|wasp|hornet|yellow ?jacket|hive|nest/i, service: 'other', label: 'bees or wasps',
-      line: 'We relocate honeybees live where we can, and remove the comb so they do not return.' },
-  };
-
-  const DEFAULT_QUICK = [
-    { label: 'Book an inspection', value: 'I would like to book an inspection' },
-    { label: 'Get a quote', value: 'How much does it cost?' },
-    { label: 'I have a pest problem', value: 'I have a pest problem' },
-    { label: 'Talk to a human', value: 'I want to talk to a human' },
+  const DAYS = [
+    ['mon', 'Monday'], ['tue', 'Tuesday'], ['wed', 'Wednesday'], ['thu', 'Thursday'],
+    ['fri', 'Friday'], ['sat', 'Saturday'], ['sun', 'Sunday'],
   ];
 
-  const AIProvider = (() => {
-    const ctx = { pest: null, zip: null, stage: 'greeting', asked: 0 };
+  let cfg = CFG.get();
 
-    const bookQuick = (service) => ([
-      { label: 'Book inspection', value: 'Yes, book the inspection', action: 'book', service, primary: true },
-      { label: 'Get a quote', value: 'How much does it cost?' },
-      { label: 'Talk to a human', value: 'I want to talk to a human' },
-    ]);
+  /* ===================== 2. binding engine ====================== */
+  /* Every business string in index.html carries a data-bind-* attribute, so
+     the markup stays free of business detail and one config change updates
+     the whole page. */
+  function bind(c) {
+    $$('[data-bind-text]').forEach((n) => {
+      const v = read(c, n.dataset.bindText);
+      n.textContent = v == null ? '' : String(v);
+    });
 
-    const detectPest = (text) => {
-      for (const [key, def] of Object.entries(PESTS)) if (def.match.test(text)) return { key, ...def };
-      return null;
+    $$('[data-bind-href]').forEach((n) => {
+      const v = read(c, n.dataset.bindHref);
+      if (v) { n.setAttribute('href', v); n.removeAttribute('aria-disabled'); }
+      else { n.removeAttribute('href'); n.setAttribute('aria-disabled', 'true'); }
+    });
+
+    $$('[data-bind-src]').forEach((n) => {
+      const v = read(c, n.dataset.bindSrc);
+      if (v) n.setAttribute('src', v);
+    });
+
+    $$('[data-bind-alt]').forEach((n) => {
+      const v = read(c, n.dataset.bindAlt);
+      n.setAttribute('alt', v == null ? '' : String(v));
+    });
+
+    // Empty means hidden. Nothing is ever filled in with a stand-in value.
+    $$('[data-show]').forEach((n) => { n.hidden = !truthy(read(c, n.dataset.show)); });
+    $$('[data-hide]').forEach((n) => { n.hidden = truthy(read(c, n.dataset.hide)); });
+
+    $$('[data-list]').forEach((n) => {
+      const items = read(c, n.dataset.list);
+      n.replaceChildren(...(Array.isArray(items) ? items : []).map((t) => el('li', { text: t })));
+      n.hidden = !(Array.isArray(items) && items.length);
+    });
+
+    const steps = $('[data-steps]');
+    if (steps) steps.replaceChildren(...((c.about.steps || []).map((s) =>
+      el('li', {}, [el('span', { text: s.name }), el('p', { text: s.text })]))));
+
+    const year = $('[data-year]');
+    if (year) year.textContent = String(new Date().getFullYear());
+  }
+
+  const truthy = (v) => Array.isArray(v) ? v.length > 0 : !!(v && String(v).trim());
+
+  /* ===================== 3. SEO + structured data ====================== */
+  function seo(c) {
+    const b = c.business;
+    const title = c.$.seoTitle;
+    const desc  = c.$.seoDescription;
+    const canonical = c.$.canonical;
+
+    document.title = title;
+    document.documentElement.lang = (c.site.locale || 'en_US').split('_')[0];
+
+    const map = {
+      description: desc,
+      ogSiteName: b.name,
+      ogTitle: title,
+      ogDescription: desc,
+      ogLocale: c.site.locale,
+      twitterTitle: title,
+      twitterDescription: desc,
+      themeColor: c.site.themeColor,
     };
+    $$('[data-seo]').forEach((n) => {
+      const key = n.dataset.seo;
+      if (key === 'favicon') { if (c.branding.favicon) n.setAttribute('href', c.branding.favicon); return; }
+      if (map[key] == null) return;
+      n.setAttribute('content', map[key]);
+    });
 
-    const askZip = (prefix) => {
-      ctx.stage = 'awaiting_zip';
-      return {
-        text: `${prefix} What ZIP code are you located in?`,
-        quick: [{ label: 'Talk to a human', value: 'I want to talk to a human' }],
-      };
-    };
-
-    const offerBooking = () => {
-      ctx.stage = 'offered_booking';
-      const service = ctx.pest ? PESTS[ctx.pest].service : 'general';
-      return {
-        text: 'Thanks. We service that area. Would you like to book a free inspection?',
-        quick: bookQuick(service),
-      };
-    };
-
-    /* ---------- the rule-based receptionist ---------- */
-    const mockReply = (raw) => {
-      const text = raw.trim();
-      const t = text.toLowerCase();
-      ctx.asked++;
-
-      const zipMatch = text.match(/\b\d{5}\b/);
-
-      // Human handoff always wins
-      if (/human|person|agent|representative|real (person|someone)|speak to someone|call me/i.test(t)) {
-        ctx.stage = 'human';
-        return {
-          text: `Of course — you can reach the team directly on <strong>${CONFIG.business.phoneDisplay}</strong>, 24 hours a day. ` +
-                `If you'd rather we call you, book an inspection and a coordinator will confirm by phone within the hour.`,
-          quick: [
-            { label: 'Call now', value: '', action: 'call', primary: true },
-            { label: 'Book inspection instead', value: 'Book an inspection', action: 'book', service: ctx.pest ? PESTS[ctx.pest].service : 'general' },
-          ],
-        };
-      }
-
-      // ZIP handling
-      if (zipMatch) {
-        ctx.zip = zipMatch[0];
-        if (inServiceArea(ctx.zip)) return offerBooking();
-        ctx.stage = 'out_of_area';
-        return {
-          text: `We're mainly covering Greater Houston right now, and ${ctx.zip} sits outside our standard routes. ` +
-                `Call <strong>${CONFIG.business.phoneDisplay}</strong> and we'll check whether a technician covers your street — we often can.`,
-          quick: [{ label: 'Call now', value: '', action: 'call', primary: true }, { label: 'Start over', value: 'Hello' }],
-        };
-      }
-
-      if (ctx.stage === 'awaiting_zip' && /^\d{1,4}$/.test(t)) {
-        return { text: 'That looks like a partial ZIP — could you give me all five digits?', quick: [] };
-      }
-
-      // Confirming a booking we already offered — must be checked before the
-      // generic booking intent, otherwise "yes, book it" just re-offers.
-      const confirmBooking = () => {
-        ctx.stage = 'booking';
-        return {
-          text: "Great — I've opened the booking form and pre-selected your service. Pick a date and time and you're done.",
-          quick: [],
-          action: 'book',
-          service: ctx.pest ? PESTS[ctx.pest].service : 'general',
-        };
-      };
-
-      if (ctx.stage === 'offered_booking' &&
-          /^(yes|yeah|yep|yes please|sure|ok|okay|please|please do|go ahead|book it|do it|lets do it|let's do it)\b/i.test(t)) {
-        return confirmBooking();
-      }
-
-      // Booking intent
-      if (/book|appointment|schedule|inspection|come out|visit/i.test(t) && !/how much|price|cost/i.test(t)) {
-        if (!ctx.zip) return askZip("Happy to get that booked.");
-        if (ctx.stage === 'offered_booking' || ctx.stage === 'booking') return confirmBooking();
-        return offerBooking();
-      }
-
-      // Pricing
-      if (/how much|price|pricing|cost|quote|estimate|charge|fee/i.test(t)) {
-        return {
-          text: 'The inspection and written treatment plan are always <strong>free</strong>. Pricing after that depends on the pest, ' +
-                'the size of the property and whether you want a one-off treatment or an ongoing plan — your technician gives you a fixed number before any work starts.',
-          quick: ctx.zip ? bookQuick(ctx.pest ? PESTS[ctx.pest].service : 'general')
-                         : [{ label: 'Book free inspection', value: 'Book an inspection', action: 'book', primary: true },
-                            { label: 'What pests do you treat?', value: 'What pests do you treat?' }],
-        };
-      }
-
-      // Safety
-      if (/\b(safe|safety|pets?|dogs?|cats?|children|child|kids?|baby|toxic|chemicals?|pregnant|allerg\w*)\b/i.test(t)) {
-        return {
-          text: 'Yes — we use low-toxicity, precisely targeted products applied by licensed technicians. ' +
-                'Most treatments are safe to return to once surfaces are dry, and your technician gives you exact re-entry times for pets and children before they leave.',
-          quick: [{ label: 'Book inspection', value: 'Book an inspection', action: 'book', primary: true },
-                  { label: 'I have a pest problem', value: 'I have a pest problem' }],
-        };
-      }
-
-      // Urgency / hours
-      if (/emergency|urgent|asap|right now|tonight|today|tomorrow|how (soon|fast|quick)|same day/i.test(t)) {
-        return {
-          text: 'Most inspections go out same-day or next-day, and the support line is staffed 24/7 for active infestations. ' +
-                `If it's urgent, call <strong>${CONFIG.business.phoneDisplay}</strong> and we'll prioritise you.`,
-          quick: [{ label: 'Call now', value: '', action: 'call', primary: true },
-                  { label: 'Book earliest slot', value: 'Book an inspection', action: 'book' }],
-        };
-      }
-
-      if (/hours|open|closed|weekend|saturday|sunday/i.test(t)) {
-        return {
-          text: 'We run Monday–Friday 7am–7pm and Saturday 8am–4pm, with the emergency line open 24/7. Sundays are reserved for emergency call-outs only.',
-          quick: [{ label: 'Book inspection', value: 'Book an inspection', action: 'book', primary: true }],
-        };
-      }
-
-      // Service area
-      if (/area|cover|service (area|my)|where are you|do you come to|located/i.test(t)) {
-        return askZip('We cover Houston, Katy, Sugar Land, Pearland, The Woodlands, Cypress, Spring and the surrounding suburbs.');
-      }
-
-      // Pest identification
-      const pest = detectPest(t);
-      if (pest) {
-        ctx.pest = pest.key;
-        if (!ctx.zip) return askZip(`I can help with that. ${pest.line}`);
-        return offerBooking();
-      }
-
-      if (/pest problem|infestation|problem|issue|consultation|consult|advice|\bhelp\b/i.test(t)) {
-        ctx.stage = 'identify_pest';
-        return {
-          text: "I can help with that. What are you seeing — roaches, rodents, termites, bed bugs, ants, spiders, fleas, mosquitoes or something else?",
-          quick: [
-            { label: 'Roaches', value: 'I have roaches' },
-            { label: 'Rodents', value: 'I have rodents' },
-            { label: 'Termites', value: 'I think I have termites' },
-            { label: 'Bed bugs', value: 'I have bed bugs' },
-          ],
-        };
-      }
-
-      if (/what pests|which pests|services|what do you (do|treat|offer)/i.test(t)) {
-        return {
-          text: 'We treat cockroaches, rodents, termites, bed bugs, mosquitoes, ants, spiders, fleas, flies, bees and wasps — ' +
-                'for homes, apartments, offices and commercial properties.',
-          quick: [{ label: 'Book inspection', value: 'Book an inspection', action: 'book', primary: true },
-                  { label: 'Get a quote', value: 'How much does it cost?' }],
-        };
-      }
-
-      if (/^(hi|hey|hello|good (morning|afternoon|evening)|yo)\b/i.test(t)) {
-        return { text: 'Hi! How can I help you today?', quick: DEFAULT_QUICK.slice() };
-      }
-
-      if (/thank|thanks|cheers|appreciate/i.test(t)) {
-        return {
-          text: "You're welcome. Anything else I can sort out before you go?",
-          quick: [{ label: 'Book inspection', value: 'Book an inspection', action: 'book', primary: true },
-                  { label: "No, that's all", value: 'No thanks' }],
-        };
-      }
-
-      if (/^(no|nope|nothing|that.s all)\b/i.test(t)) {
-        return { text: `Perfect. We're here 24/7 on ${CONFIG.business.phoneDisplay} whenever you need us.`, quick: [] };
-      }
-
-      // Fallback — stays useful instead of apologising
-      return {
-        text: "I want to make sure I get this right. Tell me which pest you're dealing with and your ZIP code, " +
-              "and I'll check availability — or I can put you straight through to the team.",
-        quick: [
-          { label: 'I have a pest problem', value: 'I have a pest problem' },
-          { label: 'Book an inspection', value: 'Book an inspection', action: 'book' },
-          { label: 'Talk to a human', value: 'I want to talk to a human' },
-        ],
-      };
-    };
-
-    return {
-      reset() { ctx.pest = null; ctx.zip = null; ctx.stage = 'greeting'; ctx.asked = 0; },
-      get context() { return { ...ctx }; },
-
-      async reply(text, history) {
-        if (CONFIG.ai.provider === 'api' && CONFIG.ai.endpoint) {
-          const res = await fetch(CONFIG.ai.endpoint, {
-            method: 'POST',
-            headers: CONFIG.ai.headers,
-            body: JSON.stringify({
-              messages: [{ role: 'system', content: CONFIG.ai.systemPrompt }, ...history],
-              context: { ...ctx },
-            }),
-          });
-          if (!res.ok) throw new Error(`Assistant error ${res.status}`);
-          const data = await res.json();
-          return {
-            text: data.reply || '',
-            quick: data.quickReplies || [],
-            action: data.action,
-            service: data.service,
-          };
-        }
-        await wait(rand(CONFIG.ai.typingSpeed[0], CONFIG.ai.typingSpeed[1]));
-        return mockReply(text);
-      },
-    };
-  })();
-
-  /* ======================================================================
-     10. AI ASSISTANT UI — docking, speech, message rendering
-     ====================================================================== */
-  const Assistant = (() => {
-    const el = $('[data-ai]');
-    const dock = $('#ai-dock');
-    const fab = $('[data-ai-fab]');
-    if (!el) return { open() {} };
-
-    const log = $('[data-ai-log]', el);
-    const quickWrap = $('[data-ai-quick]', el);
-    const typing = $('[data-ai-typing]', el);
-    const form = $('[data-ai-form]', el);
-    const input = $('[data-ai-input]', el) || $('.ai__input', el);
-    const micBtn = $('[data-ai-mic]', el);
-    const ttsBtn = $('[data-ai-tts]', el);
-    const minBtn = $('[data-ai-minimise]', el);
-    const hint = $('[data-ai-hint]', el);
-
-    const desktop = window.matchMedia('(min-width: 1080px)');
-    const history = [];
-
-    let userClosed = false;          // set only when the visitor minimises it
-    let floating = false;            // shown as an overlay rather than docked
-    let heroVisible = true;
-    let greeted = false;
-    let busy = false;
-    let ttsOn = false;
-
-    /* ---------- rendering ---------- */
-    const scrollLog = () => { log.scrollTop = log.scrollHeight; };
-
-    const addMessage = (role, html) => {
-      const div = document.createElement('div');
-      div.className = `msg msg--${role}`;
-      div.innerHTML = html;
-      log.appendChild(div);
-      scrollLog();
-      return div;
-    };
-
-    const addSystem = (text) => addMessage('system', escapeHtml(text));
-
-    const setQuick = (items) => {
-      quickWrap.innerHTML = '';
-      (items || []).forEach((item, i) => {
-        const btn = document.createElement('button');
-        btn.type = 'button';
-        btn.className = 'qr' + (item.primary ? ' qr--primary' : '');
-        btn.textContent = item.label;
-        btn.style.animationDelay = `${i * 50}ms`;
-        on(btn, 'click', () => {
-          quickWrap.innerHTML = '';
-          if (item.action === 'call') { window.location.href = `tel:${CONFIG.business.phone}`; return; }
-          if (item.action === 'book' && !item.value) { handoffToBooking(item.service); return; }
-          send(item.value || item.label);
-        });
-        quickWrap.appendChild(btn);
-      });
-    };
-
-    const showTyping = (show) => {
-      typing.hidden = !show;
-      if (show) scrollLog();
-    };
-
-    /* ---------- speech ---------- */
-    const speak = (html) => {
-      if (!ttsOn || !('speechSynthesis' in window)) return;
-      const text = html.replace(/<[^>]+>/g, '');
-      window.speechSynthesis.cancel();
-      const utter = new SpeechSynthesisUtterance(text);
-      utter.lang = CONFIG.ai.speech.lang;
-      utter.rate = 1.02;
-      utter.pitch = 1;
-      window.speechSynthesis.speak(utter);
-    };
-
-    const initSpeechInput = () => {
-      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (!SR || !CONFIG.ai.speech.enabled) {
-        if (micBtn) micBtn.hidden = true;
-        return;
-      }
-      const recog = new SR();
-      recog.lang = CONFIG.ai.speech.lang;
-      recog.interimResults = true;
-      recog.continuous = false;
-      let listening = false;
-      let finalText = '';
-
-      recog.onstart = () => {
-        listening = true;
-        finalText = '';
-        micBtn.classList.add('is-listening');
-        micBtn.setAttribute('aria-label', 'Stop listening');
-        if (hint) hint.textContent = 'Listening… speak now.';
-      };
-      recog.onresult = (e) => {
-        let interim = '';
-        for (let i = e.resultIndex; i < e.results.length; i++) {
-          const chunk = e.results[i][0].transcript;
-          if (e.results[i].isFinal) finalText += chunk;
-          else interim += chunk;
-        }
-        input.value = (finalText + interim).trim();
-      };
-      recog.onerror = () => {
-        if (hint) hint.textContent = "I couldn't hear that — try again, or type your question.";
-      };
-      recog.onend = () => {
-        listening = false;
-        micBtn.classList.remove('is-listening');
-        micBtn.setAttribute('aria-label', 'Talk to us');
-        if (hint) hint.textContent = 'Press the mic to talk to us — or ask anything about pests, pricing or scheduling.';
-        const said = input.value.trim();
-        if (said) { input.value = ''; send(said); }
-      };
-
-      on(micBtn, 'click', () => {
-        if (listening) { recog.stop(); return; }
-        try { recog.start(); } catch (_) { /* already started */ }
-      });
-    };
-
-    /* ---------- conversation ---------- */
-    const handoffToBooking = (service) => {
-      Booking.prefill(service || 'general');
-      Booking.goto(service ? 2 : 1);
-      Booking.scrollIn();
-      addSystem('Booking form opened below');
-      if (!desktop.matches) closeAssistant();
-    };
-
-    const send = async (text) => {
-      if (!text || busy) return;
-      busy = true;
-      addMessage('user', escapeHtml(text));
-      history.push({ role: 'user', content: text });
-      setQuick([]);
-      showTyping(true);
-
-      try {
-        const res = await AIProvider.reply(text, history.slice(-10));
-        showTyping(false);
-        const bodyHtml = sanitizeRich(res.text || "Sorry — I didn't catch that.");
-        addMessage('bot', bodyHtml);
-        history.push({ role: 'assistant', content: bodyHtml.replace(/<[^>]+>/g, '') });
-        setQuick(res.quick);
-        speak(bodyHtml);
-
-        if (res.action === 'book') setTimeout(() => handoffToBooking(res.service), 700);
-      } catch (err) {
-        showTyping(false);
-        addMessage('bot',
-          `I'm having trouble reaching the assistant right now. Call <strong>${CONFIG.business.phoneDisplay}</strong> ` +
-          `and a coordinator will help you straight away.`);
-        setQuick([{ label: 'Call now', value: '', action: 'call', primary: true }]);
-        console.error('[Apex] Assistant error:', err);
-      } finally {
-        busy = false;
-      }
-    };
-
-    const greet = () => {
-      if (greeted) return;
-      greeted = true;
-      addMessage('bot', 'Hi! How can I help you today?');
-      setQuick(DEFAULT_QUICK.slice());
-    };
-
-    /* ---------- placement ----------
-       Desktop: docked inside the hero while the hero is on screen, otherwise
-       collapsed to the launcher. Mobile: launcher only, opening a bottom sheet.
-       The same DOM node is reparented so conversation state is never lost. */
-    const render = () => {
-      const canDock = desktop.matches && heroVisible && !userClosed && !floating;
-      const showOverlay = floating && !userClosed;
-
-      if (canDock) {
-        if (el.parentElement !== dock) dock.appendChild(el);
-        el.classList.remove('is-floating');
-        el.hidden = false;
-      } else if (showOverlay) {
-        if (el.parentElement !== document.body) document.body.appendChild(el);
-        el.classList.add('is-floating');
-        el.hidden = false;
+    // One canonical, written from the configured domain — or from wherever the
+    // page is actually being served when no domain has been set. Never invented.
+    if (canonical) {
+      link('canonical', canonical);
+      meta('og:url', canonical, 'property');
+      // Only a raster image is advertised: social platforms do not render SVG,
+      // and a share card that silently fails is worse than none at all.
+      const share = (c.images.og && c.images.og.src) || '';
+      const img = /\.svg($|\?)/i.test(share) ? '' : absolute(share, canonical);
+      if (img) {
+        meta('og:image', img, 'property');
+        meta('twitter:image', img);
+        if (c.images.og.alt) meta('og:image:alt', c.images.og.alt, 'property');
       } else {
-        el.hidden = true;
+        ['og:image', 'og:image:alt'].forEach((k) => { const n = $(`meta[property="${k}"]`); if (n) n.remove(); });
+        const t = $('meta[name="twitter:image"]'); if (t) t.remove();
       }
-
-      if (fab) fab.hidden = !el.hidden;
-      if (!el.hidden) greet();
-    };
-
-    const openAssistant = () => {
-      userClosed = false;
-      floating = !(desktop.matches && heroVisible);
-      render();
-      setTimeout(() => { if (input) input.focus({ preventScroll: true }); }, 260);
-    };
-
-    const closeAssistant = () => {
-      userClosed = true;
-      floating = false;
-      render();
-    };
-
-    /* ---------- bindings ---------- */
-    on(form, 'submit', (e) => {
-      e.preventDefault();
-      const value = input.value.trim();
-      if (!value) return;
-      input.value = '';
-      send(value);
-    });
-
-    on(minBtn, 'click', closeAssistant);
-    on(fab, 'click', openAssistant);
-
-    on(ttsBtn, 'click', () => {
-      ttsOn = !ttsOn;
-      ttsBtn.setAttribute('aria-pressed', String(ttsOn));
-      ttsBtn.setAttribute('aria-label', ttsOn ? 'Disable voice replies' : 'Enable voice replies');
-      if (!ttsOn && 'speechSynthesis' in window) window.speechSynthesis.cancel();
-      addSystem(ttsOn ? 'Voice replies on' : 'Voice replies off');
-    });
-
-    if (!('speechSynthesis' in window) && ttsBtn) ttsBtn.hidden = true;
-
-    // Buttons elsewhere on the page that open the assistant with intent
-    $$('[data-ai-open]').forEach((btn) => {
-      on(btn, 'click', () => {
-        const intent = btn.getAttribute('data-ai-intent');
-        openAssistant();
-        const seed = {
-          consultation: 'I would like a consultation',
-          pest: 'I have a pest problem',
-          human: 'I want to talk to a human',
-          quote: 'How much does it cost?',
-        }[intent];
-        if (seed) setTimeout(() => send(seed), 420);
-      });
-    });
-
-    on(document, 'keydown', (e) => {
-      if (e.key === 'Escape' && el.classList.contains('is-floating') && !el.hidden) closeAssistant();
-    });
-
-    // Dock/undock as the hero enters and leaves the viewport
-    const hero = $('.hero');
-    if (hero && 'IntersectionObserver' in window) {
-      new IntersectionObserver((entries) => {
-        heroVisible = entries[0].isIntersecting;
-        // Returning to the hero re-docks an overlay instead of stacking both.
-        if (heroVisible && floating && desktop.matches) floating = false;
-        render();
-      }, { threshold: 0.18 }).observe(hero);
+    } else {
+      const old = $('link[rel="canonical"]'); if (old) old.remove();
     }
 
-    on(desktop, 'change', () => { floating = false; render(); });
+    jsonLd(c, canonical);
+  }
 
-    initSpeechInput();
-    render();
+  function link(rel, href) {
+    let n = $(`link[rel="${rel}"]`);
+    if (!n) { n = el('link', { rel }); document.head.append(n); }
+    n.setAttribute('href', href);
+  }
 
-    return { open: openAssistant, close: closeAssistant, send };
-  })();
+  function meta(name, content, attr = 'name') {
+    let n = $(`meta[${attr}="${name}"]`);
+    if (!n) { n = el('meta', { [attr]: name }); document.head.append(n); }
+    n.setAttribute('content', content);
+  }
 
-  /* ======================================================================
-     11. LEAD CAPTURE (footer) — same adapter pattern as booking
-     ====================================================================== */
-  const LeadAPI = {
-    async submit(payload) {
-      const { provider, endpoint } = CONFIG.lead;
-      if (provider === 'webhook' && endpoint) {
-        const res = await fetch(endpoint, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        });
-        if (!res.ok) throw new Error(`Lead capture failed with status ${res.status}`);
-        return res.json().catch(() => ({ ok: true }));
-      }
-      await wait(rand(600, 1000));
-      return { ok: true, mock: true };
-    },
-  };
+  function absolute(src, base) {
+    if (!src || !base) return '';
+    if (/^(https?:|data:)/.test(src)) return src;
+    try { return new URL(src, base.endsWith('/') ? base : base + '/').href; } catch (_) { return ''; }
+  }
 
-  const initLeadForm = () => {
-    const form = $('[data-lead-form]');
-    if (!form) return;
-    const input = $('input[name="email"]', form);
-    const btn = $('button[type="submit"]', form);
-    const label = $('[data-lead-label]', form);
-    const msg = $('[data-lead-msg]', form);
-    let sending = false;
+  /* Structured data describes only what the business has actually entered.
+     No ratings, no review counts, no awards are synthesised. */
+  function jsonLd(c, canonical) {
+    const b = c.business;
+    const graph = [];
 
-    on(form, 'submit', async (e) => {
-      e.preventDefault();
-      if (sending) return;
-
-      const email = input.value.trim();
-      if (!isValidEmail(email)) {
-        input.classList.add('is-invalid');
-        msg.textContent = 'Please enter a valid email address.';
-        msg.classList.add('is-error');
-        input.focus();
-        return;
-      }
-
-      input.classList.remove('is-invalid');
-      msg.classList.remove('is-error');
-      msg.textContent = '';
-      sending = true;
-      btn.classList.add('is-loading');
-      if (label) label.textContent = '';
-
-      try {
-        await LeadAPI.submit({ email, source: 'footer-subscribe', submittedAt: new Date().toISOString() });
-        form.reset();
-        msg.textContent = "You're on the list — seasonal pest alerts and prevention tips, nothing else.";
-      } catch (err) {
-        msg.textContent = `Something went wrong. Email us at ${CONFIG.business.email} instead.`;
-        msg.classList.add('is-error');
-        console.error('[Apex] Lead capture failed:', err);
-      } finally {
-        sending = false;
-        btn.classList.remove('is-loading');
-        if (label) label.textContent = 'Join';
-      }
-    });
-
-    on(input, 'input', () => {
-      input.classList.remove('is-invalid');
-      msg.classList.remove('is-error');
-    });
-  };
-
-  /* ======================================================================
-     12. MISC
-     ====================================================================== */
-  const initMisc = () => {
-    const year = $('[data-year]');
-    if (year) year.textContent = new Date().getFullYear();
-
-    // Smooth scroll with header offset for same-page anchors
-    $$('a[href^="#"]').forEach((link) => {
-      on(link, 'click', (e) => {
-        const id = link.getAttribute('href');
-        if (!id || id === '#' || id.length < 2) return;
-        const target = document.getElementById(id.slice(1));
-        if (!target) return;
-        e.preventDefault();
-        target.scrollIntoView({ behavior: prefersReduced() ? 'auto' : 'smooth', block: 'start' });
-        if (history.pushState) history.pushState(null, '', id);
-      });
-    });
-  };
-
-  /* ======================================================================
-     13. BOOT
-     ====================================================================== */
-  const boot = () => {
-    initHeader();
-    initDrawer();
-    initScrollSpy();
-    initReveal();
-    initCounters();
-    initAccordion();
-    initCarousel();
-    initPhotoSwap();
-    initServiceShortcuts();
-    initLeadForm();
-    initMisc();
-
-    // Expose a tiny surface for future integrations / analytics.
-    window.Apex = {
-      config: CONFIG,
-      booking: Booking,
-      assistant: Assistant,
-      version: '1.0.0',
+    const biz = {
+      '@type': 'PestControlService',
+      '@id': (canonical || '') + '#business',
+      name: b.name,
+      description: b.tagline,
+      telephone: b.phone || undefined,
+      email: b.email || undefined,
     };
+    if (canonical) biz.url = canonical;
+    const share = (c.images.og && c.images.og.src) || '';
+    const img = /\.svg($|\?)/i.test(share) ? '' : absolute(share, canonical);
+    if (img) biz.image = img;
+
+    if (b.street || b.city || b.zip) {
+      biz.address = {
+        '@type': 'PostalAddress',
+        streetAddress: b.street || undefined,
+        addressLocality: b.city || undefined,
+        addressRegion: b.state || undefined,
+        postalCode: b.zip || undefined,
+        addressCountry: b.country || undefined,
+      };
+    }
+    if ((c.serviceAreas || []).length) {
+      biz.areaServed = c.serviceAreas.map((a) => ({ '@type': 'City', name: a }));
+    }
+
+    const hours = DAYS
+      .filter(([k]) => c.hours[k] && !/closed/i.test(c.hours[k]))
+      .map(([k, label]) => {
+        const [from, to] = String(c.hours[k]).split(/[–-]/).map((s) => s.trim());
+        if (!from || !to) return null;
+        return { '@type': 'OpeningHoursSpecification', dayOfWeek: label, opens: pad(from), closes: pad(to) };
+      })
+      .filter(Boolean);
+    if (hours.length) biz.openingHoursSpecification = hours;
+
+    if (c.credentials.foundedYear) biz.foundingDate = String(c.credentials.foundedYear);
+    const social = Object.values(c.social || {}).filter(Boolean);
+    if (social.length) biz.sameAs = social;
+
+    if ((c.services || []).length) {
+      biz.hasOfferCatalog = {
+        '@type': 'OfferCatalog',
+        name: 'Pest control services',
+        itemListElement: c.services.map((s) => ({
+          '@type': 'Offer',
+          itemOffered: { '@type': 'Service', name: s.name, description: s.blurb },
+        })),
+      };
+    }
+    graph.push(biz);
+
+    if ((c.faq || []).length) {
+      graph.push({
+        '@type': 'FAQPage',
+        mainEntity: c.faq.map((f) => ({
+          '@type': 'Question', name: f.q,
+          acceptedAnswer: { '@type': 'Answer', text: f.a },
+        })),
+      });
+    }
+
+    let script = $('#ld-json');
+    if (!script) { script = el('script', { type: 'application/ld+json', id: 'ld-json' }); document.head.append(script); }
+    script.textContent = JSON.stringify({ '@context': 'https://schema.org', '@graph': graph }, null, 0);
+  }
+
+  const pad = (t) => {
+    const m = String(t).match(/^(\d{1,2})(?::(\d{2}))?/);
+    return m ? `${String(m[1]).padStart(2, '0')}:${m[2] || '00'}` : t;
   };
 
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
-  else boot();
+  /* ===================== 4. content renderers ====================== */
+  const svcList  = $('[data-svc-list]');
+  const svcPanel = $('[data-svc-panel]');
+  let activeSvc = null;
+
+  function renderServices(c) {
+    if (!svcList) return;
+    const list = c.services || [];
+    if (!list.some((s) => s.id === activeSvc)) activeSvc = list[0] ? list[0].id : null;
+
+    svcList.replaceChildren(...list.map((s, i) => {
+      const btn = el('button', {
+        class: 'idx__btn', type: 'button',
+        'aria-expanded': String(s.id === activeSvc),
+        onclick: () => selectService(s.id),
+      }, [
+        el('span', { class: 'idx__n', text: String(i + 1).padStart(2, '0') }),
+        el('span', { class: 'idx__name', text: s.name }),
+        icon('i-arrow', 'idx__go'),
+        el('span', { class: 'idx__blurb', text: s.blurb || '' }),
+      ]);
+      return el('li', { class: 'idx__row' + (s.id === activeSvc ? ' on' : ''), 'data-svc': s.id }, btn);
+    }));
+
+    paintPanel(c);
+  }
+
+  function paintPanel(c) {
+    if (!svcPanel) return;
+    const s = (c.services || []).find((x) => x.id === activeSvc);
+    if (!s) { svcPanel.hidden = true; return; }
+    svcPanel.hidden = false;
+    const fig = $('.idx__fig img', svcPanel);
+    if (fig) {
+      const src = s.image || c.images.about.src;
+      if (src && fig.getAttribute('src') !== src) fig.setAttribute('src', src);
+      fig.alt = s.image ? (s.imageAlt || s.name) : (c.images.about.alt || '');
+    }
+    const name = $('[data-svc-name]', svcPanel);
+    const detail = $('[data-svc-detail]', svcPanel);
+    const book = $('[data-svc-book]', svcPanel);
+    if (name) name.textContent = s.name;
+    if (detail) detail.textContent = s.detail || s.blurb || '';
+    if (book) {
+      book.dataset.book = '';          // routes through the single booking handler
+      book.dataset.bookService = s.id;
+      book.replaceChildren(document.createTextNode('Book ' + s.name.toLowerCase() + ' '), icon('i-arrow'));
+    }
+  }
+
+  function selectService(id) {
+    activeSvc = id;
+    $$('.idx__row', svcList).forEach((row) => {
+      const on = row.dataset.svc === id;
+      row.classList.toggle('on', on);
+      const b = $('.idx__btn', row); if (b) b.setAttribute('aria-expanded', String(on));
+    });
+    paintPanel(cfg);
+    if (window.matchMedia('(max-width: 900px)').matches && svcPanel) {
+      svcPanel.scrollIntoView({ behavior: reduceMotion() ? 'auto' : 'smooth', block: 'nearest' });
+    }
+  }
+
+  /* --- FAQ accordion ------------------------------------------------- */
+  function renderFaq(c) {
+    const host = $('[data-faq]');
+    if (!host) return;
+    host.replaceChildren(...(c.faq || []).map((f, i) => {
+      const id = 'qa-' + i;
+      const answer = el('div', { class: 'qa__a', id, role: 'region' }, el('p', { text: f.a }));
+      const q = el('button', {
+        class: 'qa__q', type: 'button', 'aria-expanded': 'false', 'aria-controls': id,
+      }, [el('span', { text: f.q }), el('span', { class: 'qa__i' }, icon('i-plus'))]);
+      const item = el('div', { class: 'qa' }, [q, answer]);
+      on(q, 'click', () => {
+        const open = item.classList.toggle('on');
+        q.setAttribute('aria-expanded', String(open));
+        if (open) $$('.qa.on', host).forEach((other) => {
+          if (other === item) return;
+          other.classList.remove('on');
+          const ob = $('.qa__q', other); if (ob) ob.setAttribute('aria-expanded', 'false');
+        });
+      });
+      return item;
+    }));
+  }
+
+  /* --- footer -------------------------------------------------------- */
+  function renderFooter(c) {
+    const hours = $('[data-hours]');
+    if (hours) hours.replaceChildren(...DAYS.map(([k, label]) =>
+      el('li', {}, [el('b', { text: label.slice(0, 3) }), el('span', { text: c.hours[k] || '—' })])));
+
+    const svcLinks = $('[data-ft-services]');
+    if (svcLinks) svcLinks.replaceChildren(...(c.services || []).map((s) =>
+      el('li', {}, el('a', {
+        href: '#booking', text: s.name,
+        onclick: (e) => { e.preventDefault(); openBooking(s.id); },
+      }))));
+
+    const social = $('[data-social]');
+    if (social) {
+      const entries = Object.entries(c.social || {}).filter(([, url]) => url);
+      social.replaceChildren(...entries.map(([k, url]) =>
+        el('li', {}, el('a', {
+          href: url, rel: 'noopener', target: '_blank',
+          'aria-label': k.charAt(0).toUpperCase() + k.slice(1),
+        }, socialGlyph(k)))));
+      social.hidden = entries.length === 0;
+    }
+
+    // Credentials appear only when the business has actually entered them.
+    const legal = $('[data-credentials]');
+    if (legal) {
+      const cr = c.credentials || {};
+      const lines = [];
+      if (cr.licenceNumber) lines.push(`Licence ${cr.licenceNumber}${cr.licenceAuthority ? ' · ' + cr.licenceAuthority : ''}`);
+      if (cr.insured) lines.push('Liability insured');
+      if (cr.yearsInBusiness) lines.push(`${cr.yearsInBusiness} years in business`);
+      else if (cr.foundedYear) lines.push(`Established ${cr.foundedYear}`);
+      (cr.affiliations || []).filter(Boolean).forEach((a) => lines.push(a));
+      legal.replaceChildren(...lines.map((t) => el('span', { text: t })));
+    }
+  }
+
+  const SOCIAL_PATHS = {
+    facebook: 'M13.4 21v-8h2.7l.4-3.1h-3.1V7.9c0-.9.25-1.5 1.55-1.5H16.6V3.6A22 22 0 0 0 14.2 3.5c-2.4 0-4 1.45-4 4.12V9.9H7.5V13h2.7v8z',
+    instagram:'M12 2.2c3.2 0 3.6 0 4.85.07 1.17.05 1.8.25 2.23.41.56.22.96.48 1.38.9.42.42.68.82.9 1.38.16.42.36 1.06.41 2.23.06 1.25.07 1.63.07 4.81s0 3.56-.07 4.81c-.05 1.17-.25 1.8-.41 2.23-.22.56-.48.96-.9 1.38-.42.42-.82.68-1.38.9-.42.16-1.06.36-2.23.41-1.25.06-1.63.07-4.85.07s-3.6 0-4.85-.07c-1.17-.05-1.8-.25-2.23-.41a3.8 3.8 0 0 1-1.38-.9 3.8 3.8 0 0 1-.9-1.38c-.16-.42-.36-1.06-.41-2.23C2.21 15.56 2.2 15.18 2.2 12s0-3.56.07-4.81c.05-1.17.25-1.8.41-2.23.22-.56.48-.96.9-1.38.42-.42.82-.68 1.38-.9.42-.16 1.06-.36 2.23-.41C8.44 2.21 8.82 2.2 12 2.2Zm0 1.98c-3.13 0-3.5.01-4.73.07-1.14.05-1.76.24-2.17.4-.55.21-.94.47-1.35.88-.41.41-.67.8-.88 1.35-.16.41-.35 1.03-.4 2.17-.06 1.23-.07 1.6-.07 4.73s.01 3.5.07 4.73c.05 1.14.24 1.76.4 2.17.21.55.47.94.88 1.35.41.41.8.67 1.35.88.41.16 1.03.35 2.17.4 1.23.06 1.6.07 4.73.07s3.5-.01 4.73-.07c1.14-.05 1.76-.24 2.17-.4.55-.21.94-.47 1.35-.88.41-.41.67-.8.88-1.35.16-.41.35-1.03.4-2.17.06-1.23.07-1.6.07-4.73s-.01-3.5-.07-4.73c-.05-1.14-.24-1.76-.4-2.17a3.6 3.6 0 0 0-.88-1.35 3.6 3.6 0 0 0-1.35-.88c-.41-.16-1.03-.35-2.17-.4-1.23-.06-1.6-.07-4.73-.07Zm0 3.36a4.46 4.46 0 1 1 0 8.92 4.46 4.46 0 0 1 0-8.92Zm0 7.35a2.89 2.89 0 1 0 0-5.78 2.89 2.89 0 0 0 0 5.78Zm5.68-7.55a1.04 1.04 0 1 1-2.08 0 1.04 1.04 0 0 1 2.08 0Z',
+    x:        'M17.2 3h3.3l-7.2 8.2L21.8 21h-6.6l-5.2-6.3L4 21H.7l7.7-8.8L.4 3H7l4.7 5.8Zm-1.2 16h1.8L6.9 4.8H5z',
+    linkedin: 'M6.9 21H3.5V9.1h3.4V21ZM5.2 7.6A2 2 0 1 1 5.2 3.5a2 2 0 0 1 0 4.1ZM21 21h-3.4v-5.8c0-1.38-.03-3.16-1.93-3.16-1.93 0-2.22 1.5-2.22 3.06V21H10V9.1h3.3v1.63h.05c.46-.87 1.58-1.79 3.26-1.79 3.49 0 4.13 2.3 4.13 5.28V21Z',
+  };
+
+  function socialGlyph(key) {
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('aria-hidden', 'true');
+    const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    p.setAttribute('d', SOCIAL_PATHS[key] || SOCIAL_PATHS.facebook);
+    svg.append(p);
+    return svg;
+  }
+
+  /* --- testimonials: real ones or nothing ----------------------------- */
+  function renderTestimonials(c) {
+    const sec = $('[data-says]');
+    const list = $('[data-says-list]');
+    if (!sec || !list) return;
+    const items = Array.isArray(c.testimonials) ? c.testimonials.filter((t) => t && t.quote) : [];
+    sec.hidden = items.length === 0;
+    if (!items.length) { list.replaceChildren(); return; }
+    list.replaceChildren(...items.map((t) => {
+      const kids = [];
+      if (Number(t.rating) > 0) {
+        kids.push(el('div', { class: 'say__stars', 'aria-label': `${t.rating} out of 5` },
+          Array.from({ length: Math.round(Number(t.rating)) }, () => icon('i-star'))));
+      }
+      kids.push(el('p', { class: 'say__q', text: '“' + t.quote + '”' }));
+      kids.push(el('p', { class: 'say__who' }, [
+        el('b', { text: t.name || '' }),
+        el('span', { text: [t.location, t.source].filter(Boolean).join(' · ') }),
+      ]));
+      return el('article', { class: 'say' }, kids);
+    }));
+  }
+
+  /* ===================== 5. chrome ====================== */
+  function chrome() {
+    const hdr = $('[data-hdr]');
+    const onScroll = () => hdr && hdr.classList.toggle('stuck', window.scrollY > 12);
+    onScroll();
+    on(window, 'scroll', onScroll, { passive: true });
+
+    /* drawer */
+    const drawer = $('#drawer');
+    const burger = $('[data-menu]');
+    const openMenu = (open) => {
+      if (!drawer || !burger) return;
+      if (open) { drawer.hidden = false; requestAnimationFrame(() => drawer.classList.add('on')); }
+      else { drawer.classList.remove('on'); setTimeout(() => { drawer.hidden = true; }, 340); }
+      burger.setAttribute('aria-expanded', String(open));
+      document.body.classList.toggle('lock', open);
+      if (open) { const f = $('.drawer__x', drawer); if (f) f.focus(); } else burger.focus();
+    };
+    on(burger, 'click', () => openMenu(burger.getAttribute('aria-expanded') !== 'true'));
+    $$('[data-menu-close]').forEach((b) => on(b, 'click', () => openMenu(false)));
+    $$('.drawer__nav a').forEach((a) => on(a, 'click', () => openMenu(false)));
+    on(document, 'keydown', (e) => {
+      if (e.key !== 'Escape') return;
+      if (drawer && !drawer.hidden) openMenu(false);
+    });
+
+    /* scrollspy */
+    const links = $$('.nav a[href^="#"]');
+    const targets = links.map((a) => $(a.getAttribute('href'))).filter(Boolean);
+    if (targets.length && 'IntersectionObserver' in window) {
+      const spy = new IntersectionObserver((entries) => {
+        entries.forEach((entry) => {
+          if (!entry.isIntersecting) return;
+          links.forEach((a) => a.classList.toggle('on', a.getAttribute('href') === '#' + entry.target.id));
+        });
+      }, { rootMargin: '-45% 0px -50% 0px' });
+      targets.forEach((t) => spy.observe(t));
+    }
+
+    /* reveal — added from script so the markup stays clean */
+    if ('IntersectionObserver' in window && !reduceMotion()) {
+      const groups = [
+        ['.hero__type > *', true], ['.sec__head > *', true], ['.idx__list', false],
+        ['.idx__panel', false], ['.apr__fig', false], ['.apr__body > *', true],
+        ['.com__l > *', true], ['.com__fig', false], ['.bk__top > *', true],
+        ['.faq__head > *', true], ['.qa', true], ['.say', true], ['.cta > *', true],
+      ];
+      const seen = new Set();
+      groups.forEach(([sel, stagger]) => $$(sel).forEach((n, i) => {
+        if (seen.has(n)) return;
+        seen.add(n);
+        n.classList.add('rev');
+        if (stagger && i < 4) n.classList.add('rev-d' + Math.min(i, 3));
+      }));
+      const io = new IntersectionObserver((entries) => {
+        entries.forEach((e) => { if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); } });
+      }, { rootMargin: '0px 0px -8% 0px', threshold: 0.08 });
+      seen.forEach((n) => io.observe(n));
+    }
+
+    /* The assistant launcher steps aside while someone is mid-booking,
+       rather than floating over the controls. */
+    const fab = $('.ai-fab');
+    const bookForm = $('[data-bk-form]');
+    if (fab && bookForm && 'IntersectionObserver' in window) {
+      // Only while the form actually fills the middle of the screen, so the
+      // launcher is back the moment the visitor scrolls on.
+      new IntersectionObserver(([e]) => {
+        const panel = $('[data-ai]');
+        if (panel && !panel.hidden) return;
+        fab.hidden = e.isIntersecting;
+      }, { rootMargin: '-30% 0px -30% 0px' }).observe(bookForm);
+    }
+
+    /* any booking CTA anywhere opens the same flow */
+    on(document, 'click', (e) => {
+      const trigger = e.target.closest('[data-book]');
+      if (!trigger) return;
+      e.preventDefault();
+      openBooking(trigger.dataset.bookService || null);
+    });
+  }
+
+  /* ===================== 6. booking ====================== */
+  const bk = {
+    node: $('[data-bk]'),
+    form: $('[data-bk-form]'),
+    rail: $('[data-bk-rail]'),
+    step: 1,
+    max: 6,
+    busy: false,
+    date: null,        // Date at local midnight
+    month: null,       // first of the displayed month
+    slot: null,
+    data: {},
+  };
+
+  const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+  const fmtDate = (d) => d ? d.toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long' }) : '';
+  const midnight = (d) => { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; };
+  const addDays = (d, n) => { const x = midnight(d); x.setDate(x.getDate() + n); return x; };
+  const sameDay = (a, b) => a && b && a.toDateString() === b.toDateString();
+
+  function openBooking(serviceId) {
+    const c = cfg;
+    if (c.booking.provider === 'url' && c.booking.externalUrl) {
+      window.open(c.booking.externalUrl, '_blank', 'noopener');
+      return;
+    }
+    if (serviceId) {
+      const input = $(`[data-bk-services] input[value="${CSS.escape(serviceId)}"]`);
+      if (input) { input.checked = true; markPicked(input); }
+    }
+    if (bk.step === 7) resetBooking(serviceId);
+    else if (serviceId && bk.step === 1) goStep(2);
+    const sec = $('#booking');
+    if (sec) sec.scrollIntoView({ behavior: reduceMotion() ? 'auto' : 'smooth', block: 'start' });
+    setTimeout(() => {
+      const focusable = $(`[data-step="${bk.step}"] input, [data-step="${bk.step}"] button, [data-step="${bk.step}"] textarea`);
+      if (focusable) focusable.focus({ preventScroll: true });
+    }, reduceMotion() ? 0 : 480);
+  }
+
+  function markPicked(input) {
+    const group = input.closest('.pick');
+    if (!group) return;
+    $$('.opt', group).forEach((o) => o.classList.toggle('on', $('input', o) === input));
+  }
+
+  function renderBookingServices(c) {
+    const host = $('[data-bk-services]');
+    if (!host) return;
+    const prev = $('input:checked', host);
+    const keep = prev ? prev.value : null;
+    host.replaceChildren(...(c.services || []).map((s) => {
+      const input = el('input', { type: 'radio', name: 'service', value: s.id });
+      if (s.id === keep) input.checked = true;
+      const label = el('label', { class: 'opt' + (s.id === keep ? ' on' : '') }, [
+        input,
+        el('span', {}, [document.createTextNode(s.name), el('small', { text: s.blurb || '' })]),
+      ]);
+      on(input, 'change', () => { markPicked(input); hideErr('service'); });
+      return label;
+    }));
+  }
+
+  function renderSlots(c) {
+    const host = $('[data-bk-slots]');
+    if (!host) return;
+    if (!bk.date) {
+      host.replaceChildren(el('p', { class: 'slots__none', text: 'Choose a date first.' }));
+      return;
+    }
+    const open = c.booking.slots.filter((s) => slotOpen(bk.date, s.id));
+    if (!open.length) {
+      bk.slot = null;
+      host.replaceChildren(el('p', { class: 'slots__none', text: 'Nothing left on that day — try another.' }));
+      return;
+    }
+    if (bk.slot && !open.some((s) => s.id === bk.slot)) bk.slot = null;
+    host.replaceChildren(...open.map((s) => {
+      const btn = el('button', {
+        class: 'slot' + (bk.slot === s.id ? ' on' : ''), type: 'button',
+        role: 'radio', 'aria-checked': String(bk.slot === s.id),
+      }, el('span', { text: s.label }));
+      on(btn, 'click', () => { bk.slot = s.id; hideErr('when'); renderSlots(cfg); });
+      return btn;
+    }));
+  }
+
+  /* Deterministic pseudo-availability so the demo behaves consistently
+     instead of looking random. A real deployment replaces this with the
+     availability its booking endpoint returns. */
+  function slotOpen(date, slotId) {
+    const seed = date.getFullYear() * 10000 + (date.getMonth() + 1) * 100 + date.getDate();
+    let h = seed;
+    for (const ch of slotId) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+    return h % 7 !== 0;
+  }
+
+  function dayDisabled(c, d) {
+    const first = addDays(new Date(), Math.max(0, c.booking.leadTimeDays || 0));
+    const last = addDays(new Date(), c.booking.horizonDays || 60);
+    if (d < first || d > last) return true;
+    return (c.booking.closedWeekdays || []).includes(d.getDay());
+  }
+
+  function renderCalendar(c) {
+    const grid = $('[data-cal-grid]');
+    const label = $('[data-cal-month]');
+    if (!grid) return;
+    if (!bk.month) bk.month = new Date(midnight(new Date()).setDate(1));
+    const y = bk.month.getFullYear(), m = bk.month.getMonth();
+    if (label) label.textContent = `${MONTHS[m]} ${y}`;
+
+    const firstDow = (new Date(y, m, 1).getDay() + 6) % 7;  // Monday-first
+    const days = new Date(y, m + 1, 0).getDate();
+    const today = midnight(new Date());
+    const cells = [];
+    for (let i = 0; i < firstDow; i++) cells.push(el('span', { class: 'day void', 'aria-hidden': 'true' }));
+    for (let d = 1; d <= days; d++) {
+      const date = new Date(y, m, d);
+      const off = dayDisabled(c, date);
+      const btn = el('button', {
+        class: 'day' + (sameDay(date, today) ? ' today' : '') + (sameDay(date, bk.date) ? ' on' : ''),
+        type: 'button', text: String(d), disabled: off || undefined,
+        'aria-pressed': String(sameDay(date, bk.date)),
+        'aria-label': date.toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long' }),
+      });
+      if (!off) on(btn, 'click', () => { bk.date = date; hideErr('when'); renderCalendar(cfg); renderSlots(cfg); });
+      cells.push(btn);
+    }
+    grid.replaceChildren(...cells);
+
+    const prev = $('[data-cal-prev]'), next = $('[data-cal-next]');
+    const floor = new Date(midnight(new Date()).setDate(1));
+    const ceil = addDays(new Date(), c.booking.horizonDays || 60);
+    if (prev) prev.disabled = new Date(y, m, 1) <= floor;
+    if (next) next.disabled = new Date(y, m + 1, 1) > ceil;
+  }
+
+  const showErr = (key, msg) => {
+    const n = $(`[data-err="${key}"]`);
+    if (!n) return;
+    if (msg) n.textContent = msg;
+    n.hidden = false;
+    const field = n.closest('.f'); if (field) field.classList.add('bad');
+  };
+  const hideErr = (key) => {
+    const n = $(`[data-err="${key}"]`);
+    if (!n) return;
+    n.hidden = true;
+    const field = n.closest('.f'); if (field) field.classList.remove('bad');
+  };
+
+  function validate(step) {
+    const f = bk.form;
+    if (!f) return true;
+    if (step === 1) {
+      const v = $('[data-bk-services] input:checked');
+      if (!v) { showErr('service'); return false; }
+      hideErr('service'); return true;
+    }
+    if (step === 2) {
+      const v = $('input[name="property"]:checked', f);
+      if (!v) { showErr('property'); return false; }
+      hideErr('property'); return true;
+    }
+    if (step === 3) {
+      let ok = true;
+      const addr = f.elements.address, zip = f.elements.zip;
+      if (!addr.value.trim() || addr.value.trim().length < 4) { showErr('address'); ok = false; } else hideErr('address');
+      if (!/^\d{5}$/.test(zip.value.trim())) { showErr('zip'); ok = false; } else hideErr('zip');
+      return ok;
+    }
+    if (step === 4) {
+      if (!bk.date || !bk.slot) { showErr('when'); return false; }
+      hideErr('when'); return true;
+    }
+    if (step === 5) {
+      let ok = true;
+      const { name, phone, email, consent } = f.elements;
+      if (name.value.trim().length < 2) { showErr('name'); ok = false; } else hideErr('name');
+      if (String(phone.value).replace(/\D/g, '').length < 10) { showErr('phone'); ok = false; } else hideErr('phone');
+      if (!/^[^\s@]+@[^\s@]+\.[a-z]{2,}$/i.test(email.value.trim())) { showErr('email'); ok = false; } else hideErr('email');
+      if (!consent.checked) { showErr('consent'); ok = false; } else hideErr('consent');
+      return ok;
+    }
+    return true;
+  }
+
+  function collect() {
+    const f = bk.form;
+    const service = cfg.services.find((s) => s.id === ($('[data-bk-services] input:checked') || {}).value);
+    const slot = cfg.booking.slots.find((s) => s.id === bk.slot);
+    const prop = $('input[name="property"]:checked', f);
+    return {
+      serviceId: service ? service.id : '',
+      service: service ? service.name : '',
+      property: prop ? prop.value : '',
+      address: f.elements.address.value.trim(),
+      zip: f.elements.zip.value.trim(),
+      date: bk.date,
+      dateISO: bk.date ? bk.date.toISOString().slice(0, 10) : '',
+      dateLabel: fmtDate(bk.date),
+      slotId: bk.slot || '',
+      slot: slot ? slot.label : '',
+      name: f.elements.name.value.trim(),
+      phone: f.elements.phone.value.trim(),
+      email: f.elements.email.value.trim(),
+      notes: f.elements.notes.value.trim(),
+    };
+  }
+
+  function renderRecap() {
+    const host = $('[data-bk-recap]');
+    if (!host) return;
+    const d = collect();
+    const rows = [
+      ['Service', d.service, 1],
+      ['Property', d.property, 2],
+      ['Address', [d.address, d.zip].filter(Boolean).join(', '), 3],
+      ['When', [d.dateLabel, d.slot].filter(Boolean).join(' · '), 4],
+      ['Name', d.name, 5],
+      ['Phone', d.phone, 5],
+      ['Email', d.email, 5],
+    ];
+    if (d.notes) rows.push(['Notes', d.notes, 5]);
+    host.replaceChildren(...rows.map(([k, v, step]) => {
+      const edit = el('button', { class: 'edit', type: 'button', text: 'Change' });
+      on(edit, 'click', () => goStep(step));
+      return el('div', {}, [el('dt', { text: k }), el('dd', {}, [document.createTextNode(v || '—'), edit])]);
+    }));
+  }
+
+  function railPaint() {
+    if (!bk.rail) return;
+    $$('li', bk.rail).forEach((li) => {
+      const n = Number(li.dataset.rail);
+      li.classList.toggle('on', n === bk.step);
+      li.classList.toggle('done', n < bk.step);
+      li.setAttribute('aria-current', n === bk.step ? 'step' : 'false');
+    });
+    bk.rail.hidden = bk.step > bk.max;
+  }
+
+  function goStep(n) {
+    bk.step = n;
+    $$('[data-step]', bk.form).forEach((fs) => {
+      const active = Number(fs.dataset.step) === n;
+      fs.hidden = !active;
+      fs.classList.toggle('is-on', active);
+    });
+    railPaint();
+
+    const back = $('[data-bk-back]'), next = $('[data-bk-next]'), submit = $('[data-bk-submit]');
+    const nav = $('.bk__nav');
+    if (nav) nav.hidden = n === 7;
+    if (back) back.hidden = n === 1 || n === 7;
+    if (next) next.hidden = n >= 6;
+    if (submit) submit.hidden = n !== 6;
+
+    if (n === 4) { renderCalendar(cfg); renderSlots(cfg); }
+    if (n === 6) renderRecap();
+
+    const heading = $(`[data-step="${n}"] .bk__q`);
+    if (heading) heading.setAttribute('tabindex', '-1');
+  }
+
+  function bookingRef(d) {
+    const src = (d.zip || '') + (d.dateISO || '') + (d.slotId || '') + (d.email || '');
+    let h = 0x811c9dc5;
+    for (const ch of src) { h ^= ch.charCodeAt(0); h = Math.imul(h, 0x01000193) >>> 0; }
+    const letters = (cfg.business.shortName || cfg.business.name || 'BK').replace(/[^A-Za-z]/g, '').slice(0, 3).toUpperCase() || 'BKG';
+    return `${letters}-${(d.dateISO || '').replace(/-/g, '').slice(2)}-${h.toString(36).toUpperCase().slice(0, 4)}`;
+  }
+
+  /* The confirmation email is built from the same config as the page, so the
+     business name, phone and address in it always match the site. */
+  function buildEmail(c, d, ref) {
+    const b = c.business;
+    const lines = [
+      `${b.name} — booking confirmed`,
+      '',
+      `Hi ${d.name},`,
+      '',
+      `Your ${d.service.toLowerCase()} appointment is booked.`,
+      '',
+      `Reference   ${ref}`,
+      `Service     ${d.service}`,
+      `Property    ${d.property}`,
+      `When        ${d.dateLabel}, ${d.slot}`,
+      `Address     ${[d.address, d.zip].filter(Boolean).join(', ')}`,
+      d.notes ? `Notes       ${d.notes}` : '',
+      '',
+      'We will text you before the technician sets off. To change or cancel,',
+      `call ${b.phone}${b.email ? ' or reply to this email' : ''}.`,
+      '',
+      b.name,
+      c.$.addressLine,
+      [b.phone, b.email].filter(Boolean).join(' · '),
+    ].filter((l) => l !== '');
+    return { subject: `${b.name} — booking ${ref}`, text: lines.join('\n') };
+  }
+
+  async function submitBooking(e) {
+    e.preventDefault();
+    if (bk.busy || !validate(5)) return;
+    const c = cfg;
+    const d = collect();
+    const alert = $('[data-bk-alert]');
+    const submit = $('[data-bk-submit]');
+    const label = $('[data-bk-submit-label]');
+
+    bk.busy = true;
+    if (submit) { submit.disabled = true; submit.classList.add('busy'); }
+    if (label) label.textContent = 'Confirming…';
+    if (alert) alert.hidden = true;
+
+    const ref = bookingRef(d);
+    const email = buildEmail(c, d, ref);
+    const payload = {
+      reference: ref, business: c.business.name, submittedAt: new Date().toISOString(),
+      service: d.service, serviceId: d.serviceId, property: d.property,
+      address: d.address, zip: d.zip, date: d.dateISO, slot: d.slot, slotId: d.slotId,
+      name: d.name, phone: d.phone, email: d.email, notes: d.notes,
+    };
+
+    let ok = true;
+    // Nothing leaves the browser unless an endpoint has been configured.
+    if (c.booking.provider === 'webhook' && c.booking.endpoint) {
+      try {
+        const res = await fetch(c.booking.endpoint, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+        });
+        ok = res.ok;
+        if (!ok && alert) { alert.textContent = 'We could not reach the booking system. Call us and we will sort it out.'; alert.hidden = false; }
+      } catch (err) {
+        ok = false;
+        if (alert) { alert.textContent = 'No connection. Check your network, or call us and we will book it for you.'; alert.hidden = false; }
+      }
+    } else {
+      await new Promise((r) => setTimeout(r, 620));
+    }
+
+    bk.busy = false;
+    if (submit) { submit.disabled = false; submit.classList.remove('busy'); }
+    if (label) label.textContent = 'Confirm appointment';
+    if (!ok) return;
+
+    showDone(c, d, ref, email);
+  }
+
+  function showDone(c, d, ref, email) {
+    const receipt = $('[data-bk-receipt]');
+    if (receipt) {
+      const rows = [
+        ['Service', d.service], ['Date', d.dateLabel], ['Time', d.slot],
+        ['Address', [d.address, d.zip].filter(Boolean).join(', ')], ['Reference', ref],
+      ];
+      receipt.replaceChildren(...rows.map(([k, v]) =>
+        el('div', {}, [el('dt', { text: k }), el('dd', { text: v || '—' })])));
+    }
+
+    const who = $('[data-done="email"]');
+    if (who) who.textContent = d.email;
+
+    // Say exactly what happened. No claim that an email was sent when no
+    // booking endpoint is connected.
+    const sub = $('.done__sub');
+    const connected = c.booking.provider === 'webhook' && !!c.booking.endpoint;
+    if (sub) {
+      sub.replaceChildren(
+        ...(connected
+          ? [document.createTextNode('A confirmation is on its way to '), el('b', { text: d.email }),
+             document.createTextNode('. We will text you before the technician sets off.')]
+          : [document.createTextNode('Your request is saved in this browser. No email has been sent — connect a booking endpoint in Business Setup to deliver confirmations to '),
+             el('b', { text: d.email }), document.createTextNode(' automatically.')])
+      );
+    }
+
+    const acts = $('.done__act');
+    if (acts && !$('[data-bk-mail]', acts)) {
+      const mail = el('button', { class: 'btn btn--ghost', type: 'button', 'data-bk-mail': '', text: 'Open confirmation email' });
+      on(mail, 'click', () => {
+        const to = encodeURIComponent(d.email);
+        window.location.href = `mailto:${to}?subject=${encodeURIComponent(email.subject)}&body=${encodeURIComponent(email.text)}`;
+      });
+      acts.append(mail);
+    }
+
+    try { sessionStorage.setItem('lastBooking', JSON.stringify({ ref, ...d, date: d.dateISO })); } catch (_) {}
+
+    goStep(7);
+    const h = $('.done__h');
+    if (h) { h.setAttribute('tabindex', '-1'); h.focus({ preventScroll: true }); }
+    const sec = $('#booking');
+    if (sec) sec.scrollIntoView({ behavior: reduceMotion() ? 'auto' : 'smooth', block: 'start' });
+  }
+
+  function resetBooking(serviceId) {
+    if (bk.form) bk.form.reset();
+    $$('.opt.on').forEach((o) => o.classList.remove('on'));
+    $$('.err').forEach((n) => { n.hidden = true; });
+    $$('.f.bad').forEach((n) => n.classList.remove('bad'));
+    bk.date = null; bk.slot = null; bk.month = null;
+    const mail = $('[data-bk-mail]'); if (mail) mail.remove();
+    renderBookingServices(cfg);
+    if (serviceId) {
+      const input = $(`[data-bk-services] input[value="${CSS.escape(serviceId)}"]`);
+      if (input) { input.checked = true; markPicked(input); }
+    }
+    goStep(1);
+  }
+
+  function initBooking() {
+    if (!bk.form) return;
+    on($('[data-bk-next]'), 'click', () => { if (validate(bk.step)) goStep(Math.min(bk.step + 1, 6)); });
+    on($('[data-bk-back]'), 'click', () => goStep(Math.max(bk.step - 1, 1)));
+    on(bk.form, 'submit', submitBooking);
+    on($('[data-bk-reset]'), 'click', () => resetBooking(null));
+    on($('[data-cal-prev]'), 'click', () => { bk.month = new Date(bk.month.getFullYear(), bk.month.getMonth() - 1, 1); renderCalendar(cfg); });
+    on($('[data-cal-next]'), 'click', () => { bk.month = new Date(bk.month.getFullYear(), bk.month.getMonth() + 1, 1); renderCalendar(cfg); });
+
+    $$('input[name="property"]', bk.form).forEach((input) =>
+      on(input, 'change', () => { markPicked(input); hideErr('property'); }));
+    ['address', 'zip', 'name', 'phone', 'email'].forEach((key) =>
+      on(bk.form.elements[key], 'input', () => hideErr(key)));
+    on(bk.form.elements.consent, 'change', () => hideErr('consent'));
+
+    // "Are we in your area?" — answered from the configured list, not invented.
+    const area = $('[data-bk-area]');
+    const checkArea = () => {
+      if (!area) return;
+      const zip = bk.form.elements.zip.value.trim();
+      if (zip.length < 5) { area.textContent = ''; return; }
+      area.replaceChildren(document.createTextNode('We cover '), el('b', { text: cfg.$.areasLine }),
+        document.createTextNode('. Not on the list? Book anyway and we will tell you straight away.'));
+    };
+    on(bk.form.elements.zip, 'input', checkArea);
+
+    goStep(1);
+  }
+
+  /* ===================== 7. business setup ====================== */
+  /* A small local admin. It writes to localStorage through businessConfig
+     and nowhere else — no network call is made from this panel. */
+  const SETUP_TABS = [
+    { id: 'business', label: 'Business' },
+    { id: 'hours',    label: 'Hours' },
+    { id: 'services', label: 'Services' },
+    { id: 'content',  label: 'Content' },
+    { id: 'brand',    label: 'Brand' },
+    { id: 'booking',  label: 'Booking' },
+  ];
+
+  const setup = {
+    node: $('[data-setup]'),
+    body: $('[data-setup-body]'),
+    tabs: $('[data-setup-tabs]'),
+    state: $('[data-setup-state]'),
+    tab: 'business',
+    lastFocus: null,
+  };
+
+  const note = (t) => el('p', { class: 'setup__note', text: t });
+
+  function field(c, spec) {
+    const value = read(c, spec.path);
+    const dflt = read(CFG.defaults(), spec.path);
+    const id = 'set-' + spec.path.replace(/\./g, '-');
+    const changed = JSON.stringify(value) !== JSON.stringify(dflt);
+
+    let input;
+    if (spec.type === 'check') {
+      input = el('input', { type: 'checkbox', id });
+      input.checked = !!value;
+      on(input, 'change', () => save(spec.path, input.checked));
+      const row = el('label', { class: 'fld fld--row', for: id }, [input, el('span', { text: spec.label })]);
+      if (spec.hint) return el('div', {}, [row, el('small', { class: 'setup__note', text: spec.hint })]);
+      return row;
+    }
+
+    if (spec.type === 'select') {
+      input = el('select', { id });
+      spec.options.forEach(([v, l]) => {
+        const o = el('option', { value: v, text: l });
+        if (String(value) === v) o.selected = true;
+        input.append(o);
+      });
+      on(input, 'change', () => save(spec.path, input.value));
+    } else if (spec.type === 'textarea' || spec.type === 'lines') {
+      input = el('textarea', { id, rows: spec.rows || 4 });
+      input.value = spec.type === 'lines' ? (Array.isArray(value) ? value : []).join('\n') : (value || '');
+      on(input, 'input', debounce(() => {
+        save(spec.path, spec.type === 'lines'
+          ? input.value.split('\n').map((s) => s.trim()).filter(Boolean)
+          : input.value);
+      }, 380));
+    } else {
+      input = el('input', { type: spec.type || 'text', id, placeholder: spec.placeholder || '' });
+      input.value = value == null ? '' : String(value);
+      if (spec.type === 'number') { if (spec.min != null) input.min = spec.min; if (spec.max != null) input.max = spec.max; }
+      on(input, 'input', debounce(() => {
+        save(spec.path, spec.type === 'number' ? Number(input.value || 0) : input.value);
+      }, 380));
+    }
+
+    const kids = [el('span', { text: spec.label }), input];
+    if (spec.hint) kids.splice(1, 0, el('small', { text: spec.hint }));
+    return el('label', { class: 'fld' + (changed ? ' fld--changed' : ''), for: id }, kids);
+  }
+
+  function imageField(c, key, label) {
+    const path = `images.${key}.src`;
+    const src = read(c, path) || '';
+    const meta = read(c, `images.${key}`) || {};
+    const thumb = el('img', { class: 'setup__thumb', alt: '', src: src || '', loading: 'lazy' });
+    const file = el('input', { type: 'file', accept: 'image/*', hidden: true });
+    const pick = el('button', { class: 'btn btn--ghost btn--sm', type: 'button', text: 'Upload' });
+    const clear = el('button', { class: 'btn btn--ghost btn--sm', type: 'button', text: 'Clear' });
+
+    on(pick, 'click', () => file.click());
+    on(file, 'change', () => {
+      const f = file.files && file.files[0];
+      if (!f) return;
+      if (f.size > 900 * 1024) { flash('That image is over 900 KB — link to it by URL instead.', 'warn'); return; }
+      const reader = new FileReader();
+      reader.onload = () => { thumb.src = String(reader.result); save(path, String(reader.result)); };
+      reader.readAsDataURL(f);
+    });
+    on(clear, 'click', () => { const d = read(CFG.defaults(), path) || ''; thumb.src = d; save(path, d); });
+
+    const url = el('input', { type: 'text', value: src, placeholder: 'assets/img/your-photo.jpg' });
+    on(url, 'input', debounce(() => { thumb.src = url.value; save(path, url.value); }, 400));
+
+    const alt = el('input', { type: 'text', value: meta.alt || '', placeholder: 'Describe the photo for screen readers' });
+    on(alt, 'input', debounce(() => save(`images.${key}.alt`, alt.value), 400));
+
+    return el('div', { class: 'setup__card' }, [
+      el('header', {}, [el('b', { text: label }), el('span', { class: 'setup__note', text: meta.note || '' })]),
+      thumb,
+      el('label', { class: 'fld' }, [el('span', { text: 'Path or URL' }), url]),
+      el('label', { class: 'fld' }, [el('span', { text: 'Alt text' }), alt]),
+      el('div', { class: 'setup__acts' }, [pick, clear, file]),
+    ]);
+  }
+
+  /* Repeatable lists — services, FAQ, arrival windows. */
+  function repeater(c, opts) {
+    const items = (read(c, opts.path) || []).slice();
+    const write = (next) => save(opts.path, next);
+
+    const cards = items.map((item, i) => {
+      const kids = [el('header', {}, [
+        el('b', { text: `${opts.singular} ${String(i + 1).padStart(2, '0')}` }),
+        el('span', { class: 'setup__acts' }, [
+          el('button', { class: 'btn btn--ghost btn--sm', type: 'button', text: '↑', 'aria-label': 'Move up',
+            onclick: () => { if (i === 0) return; const n = items.slice(); [n[i - 1], n[i]] = [n[i], n[i - 1]]; write(n); redrawSetup(); } }),
+          el('button', { class: 'btn btn--ghost btn--sm', type: 'button', text: '↓', 'aria-label': 'Move down',
+            onclick: () => { if (i === items.length - 1) return; const n = items.slice(); [n[i + 1], n[i]] = [n[i], n[i + 1]]; write(n); redrawSetup(); } }),
+          el('button', { class: 'btn btn--ghost btn--sm setup__reset', type: 'button', text: 'Remove',
+            onclick: () => { const n = items.slice(); n.splice(i, 1); write(n); redrawSetup(); } }),
+        ]),
+      ])];
+
+      opts.fields.forEach((f) => {
+        const input = f.type === 'textarea'
+          ? el('textarea', { rows: f.rows || 2 })
+          : el('input', { type: 'text', placeholder: f.placeholder || '' });
+        input.value = item[f.key] == null ? '' : String(item[f.key]);
+        on(input, 'input', debounce(() => {
+          const n = items.slice();
+          n[i] = { ...n[i], [f.key]: input.value };
+          if (opts.slug && f.key === opts.slug.from && !item.idLocked) n[i][opts.slug.to] = slugify(input.value) || n[i][opts.slug.to];
+          write(n);
+        }, 400));
+        kids.push(el('label', { class: 'fld' }, [el('span', { text: f.label }), input]));
+      });
+
+      return el('div', { class: 'setup__card' }, kids);
+    });
+
+    const add = el('button', { class: 'btn btn--ghost btn--sm', type: 'button', text: `Add ${opts.singular.toLowerCase()}`,
+      onclick: () => { write(items.concat([{ ...opts.blank }])); redrawSetup(); } });
+
+    return el('div', { class: 'setup__grp' }, [
+      el('h3', { text: opts.title }),
+      opts.note ? note(opts.note) : null,
+      ...cards,
+      add,
+    ].filter(Boolean));
+  }
+
+  const slugify = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '').slice(0, 24);
+
+  function group(title, kids, hint) {
+    return el('div', { class: 'setup__grp' }, [el('h3', { text: title }), hint ? note(hint) : null, ...kids].filter(Boolean));
+  }
+
+  function buildTab(c, tab) {
+    const F = (spec) => field(c, spec);
+
+    if (tab === 'business') return [
+      group('Identity', [
+        F({ path: 'business.name', label: 'Business name' }),
+        el('div', { class: 'fld--2' }, [
+          F({ path: 'business.shortName', label: 'Short name', hint: 'Used where space is tight' }),
+          F({ path: 'branding.logoText', label: 'Wordmark' }),
+        ]),
+        F({ path: 'business.tagline', label: 'Tagline', type: 'textarea', rows: 2,
+            hint: 'One plain sentence. It is also the meta description.' }),
+      ]),
+      group('Contact', [
+        el('div', { class: 'fld--2' }, [
+          F({ path: 'business.phone', label: 'Phone', type: 'tel' }),
+          F({ path: 'business.email', label: 'Email', type: 'email' }),
+        ]),
+        F({ path: 'business.emergencyAvailable', label: 'We answer an out-of-hours line', type: 'check' }),
+        F({ path: 'business.emergencyPhone', label: 'Emergency phone', type: 'tel' }),
+      ], 'Phone numbers become tel: links and emails become mailto: links automatically.'),
+      group('Address', [
+        F({ path: 'business.street', label: 'Street' }),
+        el('div', { class: 'fld--3' }, [
+          F({ path: 'business.city', label: 'City' }),
+          F({ path: 'business.state', label: 'State' }),
+          F({ path: 'business.zip', label: 'ZIP' }),
+        ]),
+        F({ path: 'business.country', label: 'Country code', placeholder: 'US' }),
+      ]),
+      group('Service areas', [
+        F({ path: 'serviceAreas', label: 'One area per line', type: 'lines', rows: 6 }),
+      ]),
+    ];
+
+    if (tab === 'hours') return [
+      group('Opening hours', DAYS.map(([k, label]) =>
+        F({ path: `hours.${k}`, label, placeholder: '7:00 – 19:00 or Closed' })),
+        'Written as “7:00 – 19:00”. Type “Closed” for a day you do not open.'),
+      group('Note', [F({ path: 'hours.note', label: 'Shown under the hours', type: 'textarea', rows: 2 })]),
+    ];
+
+    if (tab === 'services') return [
+      repeater(c, {
+        path: 'services', title: 'Services', singular: 'Service',
+        note: 'These drive the services list, the footer links and the first booking step.',
+        blank: { id: 'new-service', name: 'New service', blurb: '', detail: '' },
+        slug: { from: 'name', to: 'id' },
+        fields: [
+          { key: 'name', label: 'Name' },
+          { key: 'blurb', label: 'One line', type: 'textarea', rows: 2 },
+          { key: 'detail', label: 'Longer description', type: 'textarea', rows: 3 },
+          { key: 'image', label: 'Photo (optional)', placeholder: 'assets/img/rodents.jpg' },
+        ],
+      }),
+    ];
+
+    if (tab === 'content') return [
+      group('Headlines', [
+        el('div', { class: 'fld--2' }, [
+          F({ path: 'copy.heroLine1', label: 'Hero, first line' }),
+          F({ path: 'copy.heroLine2', label: 'Hero, second line', hint: 'Set in italic' }),
+        ]),
+        F({ path: 'copy.heroKicker', label: 'Above the headline' }),
+        F({ path: 'copy.servicesHeading', label: 'Services heading' }),
+        F({ path: 'copy.faqHeading', label: 'Answers heading' }),
+        F({ path: 'copy.ctaHeading', label: 'Closing heading' }),
+      ]),
+      group('For businesses', [
+        F({ path: 'copy.commercialHeading', label: 'Heading' }),
+        F({ path: 'copy.commercialBody', label: 'Body', type: 'textarea', rows: 3 }),
+        F({ path: 'copy.commercialCta', label: 'Button' }),
+      ]),
+      group('Section labels', [
+        el('div', { class: 'fld--2' }, [
+          F({ path: 'copy.servicesMark', label: '01' }),
+          F({ path: 'copy.approachMark', label: '02' }),
+        ]),
+        el('div', { class: 'fld--2' }, [
+          F({ path: 'copy.commercialMark', label: '03' }),
+          F({ path: 'copy.bookingMark', label: '04' }),
+        ]),
+        el('div', { class: 'fld--2' }, [
+          F({ path: 'copy.faqMark', label: '05' }),
+          F({ path: 'copy.saysMark', label: '06' }),
+        ]),
+        F({ path: 'copy.ctaAreasLabel', label: 'Before the service areas' }),
+      ]),
+      group('Buttons', [
+        F({ path: 'cta.primary', label: 'Primary call to action' }),
+        el('div', { class: 'fld--2' }, [
+          F({ path: 'cta.nav', label: 'Header button' }),
+          F({ path: 'cta.secondary', label: 'Secondary label' }),
+        ]),
+      ]),
+      group('How we work', [
+        F({ path: 'about.heading', label: 'Heading' }),
+        F({ path: 'about.body', label: 'Body', type: 'textarea', rows: 5 }),
+      ]),
+      repeater(c, {
+        path: 'about.steps', title: 'The steps', singular: 'Step',
+        blank: { name: '', text: '' },
+        fields: [
+          { key: 'name', label: 'Name' },
+          { key: 'text', label: 'What happens', type: 'textarea', rows: 2 },
+        ],
+      }),
+      group('Promises', [
+        F({ path: 'trust', label: 'One per line', type: 'lines', rows: 5 }),
+      ], 'Only things you actually do. No numbers, no percentages, no awards.'),
+      group('Credentials', [
+        el('div', { class: 'fld--2' }, [
+          F({ path: 'credentials.licenceNumber', label: 'Licence number', placeholder: 'Leave blank if none',
+              hint: 'Shown beside the hero kicker and in the footer once entered.' }),
+          F({ path: 'credentials.licenceAuthority', label: 'Issued by' }),
+        ]),
+        el('div', { class: 'fld--2' }, [
+          F({ path: 'credentials.yearsInBusiness', label: 'Years in business' }),
+          F({ path: 'credentials.foundedYear', label: 'Founded' }),
+        ]),
+        F({ path: 'credentials.insured', label: 'We carry liability insurance', type: 'check' }),
+        F({ path: 'credentials.affiliations', label: 'Memberships, one per line', type: 'lines', rows: 3 }),
+      ], 'Anything left blank is not shown anywhere. Nothing here is ever filled in for you.'),
+      repeater(c, {
+        path: 'faq', title: 'Questions', singular: 'Question',
+        blank: { q: '', a: '' },
+        fields: [
+          { key: 'q', label: 'Question' },
+          { key: 'a', label: 'Answer', type: 'textarea', rows: 3 },
+        ],
+      }),
+      repeater(c, {
+        path: 'testimonials', title: 'Reviews', singular: 'Review',
+        note: 'Real reviews only, with the customer’s permission. Leave this empty and the section does not appear.',
+        blank: { quote: '', name: '', location: '', source: '', rating: '' },
+        fields: [
+          { key: 'quote', label: 'What they said', type: 'textarea', rows: 3 },
+          { key: 'name', label: 'Name' },
+          { key: 'location', label: 'Area' },
+          { key: 'source', label: 'Where it was left', placeholder: 'Google, Yelp…' },
+          { key: 'rating', label: 'Stars out of 5', placeholder: 'Leave blank to hide' },
+        ],
+      }),
+    ];
+
+    if (tab === 'brand') return [
+      group('Wordmark', [
+        el('div', { class: 'fld--2' }, [
+          F({ path: 'branding.logoText', label: 'First word' }),
+          F({ path: 'branding.logoTextAccent', label: 'Second word' }),
+        ]),
+        F({ path: 'branding.logoImage', label: 'Logo image URL', hint: 'Replaces the wordmark when set' }),
+        F({ path: 'branding.favicon', label: 'Favicon URL or data URI' }),
+        F({ path: 'site.themeColor', label: 'Browser theme colour', placeholder: '#0B3B44' }),
+      ]),
+      group('Photography', [
+        imageField(c, 'hero', 'Hero'),
+        imageField(c, 'about', 'Services panel'),
+        imageField(c, 'process', 'How we work'),
+        imageField(c, 'commercial', 'Commercial'),
+        imageField(c, 'og', 'Social share card'),
+      ], 'Swap the demo artwork for your own photographs. Upload keeps the image in this browser; a path or URL is better for a live site.'),
+    ];
+
+    if (tab === 'booking') return [
+      group('How bookings are handled', [
+        F({ path: 'booking.provider', label: 'Mode', type: 'select', options: [
+          ['local', 'Built-in flow — stays in this browser'],
+          ['webhook', 'Send to my endpoint'],
+          ['url', 'Send visitors to another booking page'],
+        ] }),
+        F({ path: 'booking.endpoint', label: 'Endpoint URL', type: 'url', placeholder: 'https://…', hint: 'Bookings are POSTed here as JSON. Nothing is sent anywhere until this is set.' }),
+        F({ path: 'booking.externalUrl', label: 'External booking page', type: 'url', placeholder: 'https://calendly.com/…' }),
+      ]),
+      group('Availability', [
+        el('div', { class: 'fld--2' }, [
+          F({ path: 'booking.leadTimeDays', label: 'Earliest booking (days out)', type: 'number', min: 0, max: 30 }),
+          F({ path: 'booking.horizonDays', label: 'Latest booking (days out)', type: 'number', min: 7, max: 365 }),
+        ]),
+      ]),
+      repeater(c, {
+        path: 'booking.slots', title: 'Arrival windows', singular: 'Window',
+        blank: { id: 'new', label: '' },
+        slug: { from: 'label', to: 'id' },
+        fields: [{ key: 'label', label: 'Shown to the customer', placeholder: '8:00 – 10:00 am' }],
+      }),
+      group('Website', [
+        F({ path: 'site.domain', label: 'Production domain', type: 'url', placeholder: 'https://www.yourbusiness.com',
+            hint: 'Sets the canonical URL, Open Graph URL and structured data. Left blank, the site uses whatever address it is served from — no domain is invented.' }),
+        F({ path: 'site.locale', label: 'Locale', placeholder: 'en_US' }),
+      ]),
+    ];
+
+    return [];
+  }
+
+  function redrawSetup() {
+    if (!setup.body) return;
+    const c = CFG.get();
+    setup.body.replaceChildren(...buildTab(c, setup.tab));
+    setup.body.scrollTop = 0;
+  }
+
+  function drawTabs() {
+    if (!setup.tabs) return;
+    setup.tabs.replaceChildren(...SETUP_TABS.map((t) =>
+      el('button', {
+        class: 'setup__tab', type: 'button', role: 'tab', text: t.label,
+        'aria-selected': String(t.id === setup.tab),
+        onclick: () => { setup.tab = t.id; drawTabs(); redrawSetup(); },
+      })));
+  }
+
+  let flashTimer;
+  function flash(msg, tone) {
+    if (!setup.state) return;
+    setup.state.replaceChildren(...(tone === 'warn' ? [] : [icon('i-check')]), document.createTextNode(' ' + msg));
+    setup.state.dataset.tone = tone || 'ok';
+    clearTimeout(flashTimer);
+    flashTimer = setTimeout(idleState, 3200);
+  }
+
+  function idleState() {
+    if (!setup.state) return;
+    const kb = Math.round(CFG.storageUsed() / 102.4) / 10;
+    setup.state.dataset.tone = 'ok';
+    setup.state.replaceChildren(document.createTextNode(
+      CFG.isCustomised() ? `Saved in this browser · ${kb} KB` : 'Using the default settings'));
+  }
+
+  function save(path, value) {
+    const res = CFG.set(patchOf(path, value));
+    if (res && res.ok === false) flash(res.error, 'warn');
+    else flash('Changes saved locally', 'ok');
+  }
+
+  function openSetup(open) {
+    if (!setup.node) return;
+    if (open) {
+      setup.lastFocus = document.activeElement;
+      drawTabs(); redrawSetup(); idleState();
+      setup.node.hidden = false;
+      document.body.classList.add('lock');
+      const first = $('.setup__tab', setup.node); if (first) first.focus();
+    } else {
+      setup.node.hidden = true;
+      document.body.classList.remove('lock');
+      if (setup.lastFocus) setup.lastFocus.focus();
+    }
+  }
+
+  function initSetup() {
+    if (!setup.node) return;
+    $$('[data-setup-open]').forEach((b) => on(b, 'click', () => openSetup(true)));
+    $$('[data-setup-close]').forEach((b) => on(b, 'click', () => openSetup(false)));
+    on(document, 'keydown', (e) => { if (e.key === 'Escape' && !setup.node.hidden) openSetup(false); });
+
+    on($('[data-setup-export]'), 'click', () => {
+      const blob = new Blob([CFG.exportJSON()], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = el('a', { href: url, download: 'business-settings.json' });
+      document.body.append(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      flash('Settings downloaded', 'ok');
+    });
+
+    const file = $('[data-setup-file]');
+    on($('[data-setup-import]'), 'click', () => file && file.click());
+    on(file, 'change', () => {
+      const f = file.files && file.files[0];
+      if (!f) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        const res = CFG.importJSON(String(reader.result));
+        if (res.ok === false) flash(res.error, 'warn');
+        else { drawTabs(); redrawSetup(); flash('Settings imported', 'ok'); }
+        file.value = '';
+      };
+      reader.readAsText(f);
+    });
+
+    on($('[data-setup-reset]'), 'click', () => {
+      if (!window.confirm('Reset every setting back to the defaults? Anything you have changed in this browser will be lost.')) return;
+      CFG.reset();
+      redrawSetup();
+      flash('Reset to defaults', 'ok');
+    });
+  }
+
+  /* ===================== 8. assistant ====================== */
+  /* Answers come from the FAQ and the business details in config — there is
+     no model call and nothing typed here leaves the browser. */
+  const ai = {
+    node: $('[data-ai]'),
+    log: $('[data-ai-log]'),
+    form: $('[data-ai-form]'),
+    input: $('#ai-in'),
+    quick: $('[data-ai-quick]'),
+    typing: $('[data-ai-typing]'),
+    speak: false,
+    started: false,
+  };
+
+  function say(text, who = 'bot', links = []) {
+    if (!ai.log) return;
+    const msg = el('div', { class: 'msg msg--' + (who === 'me' ? 'me' : 'bot') });
+    text.split('\n').forEach((line, i) => {
+      if (i) msg.append(el('br'));
+      msg.append(document.createTextNode(line));
+    });
+    links.forEach((l) => {
+      msg.append(document.createTextNode(' '));
+      msg.append(el('a', { href: l.href, text: l.text, ...(l.action ? { 'data-ai-act': l.action } : {}) }));
+    });
+    ai.log.append(msg);
+    ai.log.scrollTop = ai.log.scrollHeight;
+    if (who === 'bot' && ai.speak) speak(text);
+  }
+
+  function speak(text) {
+    if (!('speechSynthesis' in window)) return;
+    try {
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text.replace(/\s+/g, ' ').slice(0, 320));
+      u.rate = 1.02; u.pitch = 1;
+      window.speechSynthesis.speak(u);
+    } catch (_) {}
+  }
+
+  function quickReplies(items) {
+    if (!ai.quick) return;
+    ai.quick.replaceChildren(...items.map((q) =>
+      el('button', { type: 'button', text: q.label, onclick: () => { ai.quick.replaceChildren(); q.run(); } })));
+  }
+
+  const norm = (s) => String(s).toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  const STOP = new Set(['the','a','an','is','are','do','does','i','you','we','my','to','for','of','and','it','in','on','can','with','what','how','when','will']);
+
+  function bestFaq(c, q) {
+    const words = norm(q).split(' ').filter((w) => w.length > 2 && !STOP.has(w));
+    if (!words.length) return null;
+    let best = null, bestScore = 0;
+    (c.faq || []).forEach((f) => {
+      const hay = norm(f.q + ' ' + f.a);
+      let score = 0;
+      words.forEach((w) => { if (hay.includes(w)) score += w.length > 5 ? 2 : 1; });
+      if (score > bestScore) { bestScore = score; best = f; }
+    });
+    return bestScore >= 2 ? best : null;
+  }
+
+  function answer(c, q) {
+    const n = norm(q);
+    const svc = (c.services || []).find((s) => {
+      const key = norm(s.name).split(' ')[0];
+      return key.length > 3 && n.includes(key.replace(/s$/, ''));
+    });
+
+    // An explicit booking verb — not just the word "inspection", which turns
+    // up in plenty of questions that are not a request to book.
+    if (/\b(book|booking|schedule|arrange|come out|send someone|make an appointment)\b/.test(n)) {
+      return { text: svc
+        ? `I can start that now — ${svc.name.toLowerCase()}, free inspection first.`
+        : 'I can start a booking now. It takes about a minute and the inspection is free.',
+        quick: [
+          { label: svc ? `Book ${svc.name.toLowerCase()}` : 'Start booking', run: () => { closeAi(); openBooking(svc ? svc.id : null); } },
+          { label: 'Call instead', run: () => { if (c.$.telHref) window.location.href = c.$.telHref; } },
+        ] };
+    }
+
+    // The business's own answers come before anything generated here.
+    const faqHit = bestFaq(c, q);
+    if (faqHit) {
+      return { text: faqHit.a, quick: svc
+        ? [{ label: `Book ${svc.name.toLowerCase()}`, run: () => { closeAi(); openBooking(svc.id); } }]
+        : [{ label: 'Book an inspection', run: () => { closeAi(); openBooking(null); } }] };
+    }
+
+    if (svc) {
+      return { text: `${s2(svc.detail || svc.blurb)}`,
+        quick: [{ label: `Book ${svc.name.toLowerCase()}`, run: () => { closeAi(); openBooking(svc.id); } }] };
+    }
+
+    if (/\b(hour|open|close|today|tonight|weekend|sunday|saturday)\b/.test(n)) {
+      const line = DAYS.map(([k, l]) => `${l.slice(0, 3)} ${c.hours[k] || '—'}`).join('\n');
+      return { text: 'Here are the hours:\n' + line + (c.hours.note ? '\n' + c.hours.note : '') };
+    }
+
+    if (/\b(where|area|cover|serve|located|address|zip)\b/.test(n)) {
+      return { text: `We are at ${c.$.addressLine}, and we cover ${c.$.areasLine}.` };
+    }
+
+    if (/\b(call|phone|number|speak|talk|human)\b/.test(n)) {
+      return { text: `${c.business.phone} gets you a person.`,
+        quick: [{ label: 'Call now', run: () => { if (c.$.telHref) window.location.href = c.$.telHref; } }] };
+    }
+
+    if (/\b(email|mail|write)\b/.test(n) && c.business.email) {
+      return { text: `${c.business.email} — we usually reply the same working day.` };
+    }
+
+    return { text: 'I am not sure about that one — it is worth asking a technician directly.',
+      quick: [
+        { label: 'Call us', run: () => { if (c.$.telHref) window.location.href = c.$.telHref; } },
+        { label: 'Book an inspection', run: () => { closeAi(); openBooking(null); } },
+      ] };
+  }
+
+  const s2 = (t) => String(t || '').trim();
+
+  function ask(text) {
+    const c = cfg;
+    say(text, 'me');
+    if (ai.quick) ai.quick.replaceChildren();
+    if (ai.typing) ai.typing.hidden = false;
+    setTimeout(() => {
+      if (ai.typing) ai.typing.hidden = true;
+      const res = answer(c, text);
+      say(res.text, 'bot');
+      if (res.quick) quickReplies(res.quick);
+    }, reduceMotion() ? 120 : 460 + Math.min(text.length * 8, 420));
+  }
+
+  function openAi(open) {
+    if (!ai.node) return;
+    const fab = $('.ai-fab');
+    ai.node.hidden = !open;
+    if (fab) fab.hidden = open;
+    if (!open) { if ('speechSynthesis' in window) window.speechSynthesis.cancel(); return; }
+    if (!ai.started) {
+      ai.started = true;
+      const c = cfg;
+      say(`Hi — ask me anything about ${c.business.name.toLowerCase().includes('pest') ? 'pest control' : 'what we do'}, or I can book you in.`, 'bot');
+      quickReplies([
+        { label: 'Book an inspection', run: () => { closeAi(); openBooking(null); } },
+        { label: 'What does it cost?', run: () => ask('What does the inspection cost?') },
+        { label: 'Is it safe for pets?', run: () => ask('Is the treatment safe around pets?') },
+      ]);
+    }
+    if (ai.input) ai.input.focus();
+  }
+  const closeAi = () => openAi(false);
+
+  function initAi() {
+    if (!ai.node) return;
+    $$('[data-ai-open]').forEach((b) => on(b, 'click', () => openAi(true)));
+    on($('[data-ai-close]'), 'click', () => openAi(false));
+    on(ai.form, 'submit', (e) => {
+      e.preventDefault();
+      const v = ai.input.value.trim();
+      if (!v) return;
+      ai.input.value = '';
+      ask(v);
+    });
+
+    const tts = $('[data-ai-tts]');
+    if (!('speechSynthesis' in window)) { if (tts) tts.hidden = true; }
+    else on(tts, 'click', () => {
+      ai.speak = !ai.speak;
+      tts.setAttribute('aria-pressed', String(ai.speak));
+      if (!ai.speak) window.speechSynthesis.cancel();
+    });
+
+    const mic = $('[data-ai-mic]');
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) { if (mic) mic.hidden = true; }
+    else {
+      let rec = null, listening = false;
+      on(mic, 'click', () => {
+        if (listening && rec) { rec.stop(); return; }
+        rec = new SR();
+        rec.lang = (cfg.site.locale || 'en_US').replace('_', '-');
+        rec.interimResults = false;
+        rec.maxAlternatives = 1;
+        rec.onstart = () => { listening = true; mic.setAttribute('aria-pressed', 'true'); };
+        rec.onend = () => { listening = false; mic.setAttribute('aria-pressed', 'false'); };
+        rec.onerror = () => { listening = false; mic.setAttribute('aria-pressed', 'false'); };
+        rec.onresult = (e) => {
+          const said = e.results[0] && e.results[0][0] && e.results[0][0].transcript;
+          if (said) ask(said.trim());
+        };
+        try { rec.start(); } catch (_) {}
+      });
+    }
+  }
+
+  /* ===================== boot ====================== */
+  function apply(next) {
+    cfg = next || CFG.get();
+    bind(cfg);
+    seo(cfg);
+    renderServices(cfg);
+    renderFaq(cfg);
+    renderFooter(cfg);
+    renderTestimonials(cfg);
+    renderBookingServices(cfg);
+    if (bk.step === 4) { renderCalendar(cfg); renderSlots(cfg); }
+    if (bk.step === 6) renderRecap();
+  }
+
+  apply(cfg);
+  chrome();
+  initBooking();
+  initSetup();
+  initAi();
+  CFG.subscribe(apply);
+
+  /* Deep links. Both forms work, so a campaign URL and an in-page anchor
+     behave the same:  ?service=termite#booking  and  #booking?service=termite  */
+  function deepLink() {
+    const hash = window.location.hash || '';
+    if (!hash.startsWith('#booking')) return;
+    const fromHash = hash.match(/service=([\w-]+)/);
+    const fromQuery = new URLSearchParams(window.location.search).get('service');
+    const id = (fromHash && fromHash[1]) || fromQuery || null;
+    const known = id && (cfg.services || []).some((s) => s.id === id);
+    setTimeout(() => openBooking(known ? id : null), 120);
+  }
+  deepLink();
+  on(window, 'hashchange', deepLink);
 })();

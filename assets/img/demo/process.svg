@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 1200" width="1200" height="1200" role="img" aria-label="Placeholder artwork: equipment laid out on a bench before a visit">
+<title>Placeholder artwork — replace with a photograph of your own work</title>
+<rect width="1200" height="1200" fill="#ECE7DC"/>
+<rect y="806" width="1200" height="394" fill="#E2DCCE"/>
+<path d="M0 806h1200" stroke="#0B3B44" stroke-opacity=".3" stroke-width="3"/>
+<g stroke="#0B3B44" stroke-opacity=".1" stroke-width="2"><path d="M0 872h1200M0 938h1200"/></g>
+
+<!-- sprayer -->
+<rect x="196" y="452" width="166" height="354" rx="14" fill="#0B3B44"/>
+<rect x="222" y="490" width="114" height="102" rx="5" fill="#F4F1EA" fill-opacity=".14"/>
+<rect x="250" y="410" width="58" height="48" rx="7" fill="#072A31"/>
+<rect x="258" y="384" width="42" height="30" rx="5" fill="#C6502A"/>
+<path d="M362 528c92 0 124 50 124 108v134" fill="none" stroke="#072A31" stroke-width="11" stroke-linecap="round"/>
+<rect x="460" y="770" width="50" height="36" rx="5" fill="#C6502A"/>
+<rect x="442" y="756" width="86" height="16" rx="5" fill="#072A31"/>
+
+<!-- bait stations -->
+<rect x="566" y="660" width="128" height="146" rx="8" fill="#F4F1EA" stroke="#0B3B44" stroke-width="4"/>
+<circle cx="630" cy="734" r="26" fill="none" stroke="#0B3B44" stroke-width="4"/>
+<path d="M630 708v52M604 734h52" stroke="#0B3B44" stroke-width="3"/>
+<rect x="584" y="678" width="44" height="12" rx="2" fill="#C6502A"/>
+
+<rect x="718" y="694" width="112" height="112" rx="8" fill="#F4F1EA" stroke="#0B3B44" stroke-width="4"/>
+<path d="M718 742h112" stroke="#0B3B44" stroke-opacity=".4" stroke-width="3"/>
+<rect x="736" y="710" width="40" height="12" rx="2" fill="#C6502A"/>
+
+<!-- torch -->
+<g transform="rotate(9 930 752)">
+  <rect x="856" y="732" width="148" height="44" rx="9" fill="#0B3B44"/>
+  <rect x="992" y="722" width="30" height="64" rx="7" fill="#C6502A"/>
+</g>
+
+<!-- gloves and tape on the bench -->
+<rect x="212" y="850" width="184" height="76" rx="10" fill="#0B3B44" fill-opacity=".17"/>
+<rect x="246" y="876" width="184" height="76" rx="10" fill="#0B3B44" fill-opacity=".11"/>
+<circle cx="666" cy="898" r="62" fill="none" stroke="#0B3B44" stroke-width="15"/>
+<circle cx="666" cy="898" r="25" fill="#E2DCCE" stroke="#0B3B44" stroke-width="4"/>
+<rect x="800" y="856" width="180" height="90" rx="6" fill="#F4F1EA" stroke="#0B3B44" stroke-width="3"/>
+<path d="M800 892h180" stroke="#0B3B44" stroke-opacity=".3" stroke-width="2"/>
+<rect x="822" y="870" width="66" height="10" rx="2" fill="#C6502A"/>
+
+<!-- measured rule -->
+<g stroke="#0B3B44" stroke-opacity=".25" stroke-width="2">
+  <path d="M196 292h808M196 292v16M398 292v16M600 292v16M802 292v16M1004 292v16"/>
+</g>
+
+<text x="600" y="964" text-anchor="middle" font-family="system-ui,sans-serif" font-size="20" letter-spacing="4" fill="#0B3B44" fill-opacity=".42">PLACEHOLDER ARTWORK</text>
+</svg>
