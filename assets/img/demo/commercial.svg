@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 1200" width="1200" height="1200" role="img" aria-label="Placeholder artwork: a commercial block serviced outside trading hours">
+<title>Placeholder artwork — replace with a photograph of your own work</title>
+<rect width="1200" height="1200" fill="#072A31"/>
+
+<rect x="150" y="430" width="180" height="420" fill="#0B3B44"/>
+<rect x="346" y="326" width="234" height="524" fill="#0B3B44"/>
+<rect x="596" y="486" width="156" height="364" fill="#0B3B44"/>
+<rect x="768" y="374" width="266" height="476" fill="#0B3B44"/>
+
+<g fill="#F4F1EA" fill-opacity=".13">
+  <rect x="180" y="468" width="40" height="32"/><rect x="246" y="532" width="40" height="32"/>
+  <rect x="180" y="596" width="40" height="32"/><rect x="246" y="724" width="40" height="32"/>
+  <rect x="378" y="368" width="48" height="36"/><rect x="458" y="368" width="48" height="36"/>
+  <rect x="378" y="496" width="48" height="36"/><rect x="512" y="562" width="48" height="36"/>
+  <rect x="378" y="690" width="48" height="36"/>
+  <rect x="626" y="528" width="40" height="32"/><rect x="690" y="626" width="40" height="32"/>
+  <rect x="800" y="424" width="52" height="40"/><rect x="880" y="424" width="52" height="40"/>
+  <rect x="958" y="520" width="52" height="40"/><rect x="800" y="632" width="52" height="40"/>
+  <rect x="880" y="740" width="52" height="40"/>
+</g>
+<g fill="#F2895F" fill-opacity=".9">
+  <rect x="458" y="628" width="48" height="36"/>
+  <rect x="880" y="520" width="52" height="40"/>
+</g>
+
+<rect y="850" width="1200" height="350" fill="#0B3B44"/>
+<path d="M0 850h1200" stroke="#F4F1EA" stroke-opacity=".2" stroke-width="2"/>
+<g stroke="#F4F1EA" stroke-opacity=".13" stroke-width="3" stroke-dasharray="22 18"><path d="M0 902h1200"/></g>
+
+<g>
+  <path d="M636 738h228v72H612v-48a24 24 0 0 1 24-24Z" fill="#F4F1EA"/>
+  <path d="M864 738h66l42 46v26H864Z" fill="#F4F1EA"/>
+  <path d="M874 750h46l30 34h-76Z" fill="#072A31" fill-opacity=".35"/>
+  <rect x="658" y="756" width="116" height="13" rx="3" fill="#C6502A"/>
+  <rect x="658" y="778" width="74" height="9" rx="3" fill="#0B3B44" fill-opacity=".45"/>
+  <circle cx="700" cy="812" r="27" fill="#072A31"/><circle cx="700" cy="812" r="11" fill="#F4F1EA"/>
+  <circle cx="932" cy="812" r="27" fill="#072A31"/><circle cx="932" cy="812" r="11" fill="#F4F1EA"/>
+</g>
+
+
+<text x="600" y="964" text-anchor="middle" font-family="system-ui,sans-serif" font-size="20" letter-spacing="4" fill="#F4F1EA" fill-opacity=".38">PLACEHOLDER ARTWORK</text>
+</svg>
